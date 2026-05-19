@@ -1,0 +1,9 @@
+[package]
+name = "qanat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = {  version = "1.52.3", features = ["full"] }
+tokio-stream = "0.1"
+futures="0.3.2"
