@@ -1,18 +1,20 @@
+use crate::errors::BusError;
 use futures::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use crate::errors::BusError;
 
-/// Unified stream returned by `subscribe` and `consume` for any bus backend.
+/// Channel-backed stream used by local-routed buses.
 pub struct BusStream<M: Clone + Send + 'static> {
     inner: ReceiverStream<M>,
 }
 
 impl<M: Clone + Send + 'static> BusStream<M> {
     pub fn new(rx: mpsc::Receiver<M>) -> Self {
-        Self { inner: ReceiverStream::new(rx) }
+        Self {
+            inner: ReceiverStream::new(rx),
+        }
     }
 }
 
@@ -35,15 +37,12 @@ impl<M: Clone + Send + 'static> Stream for BusStream<M> {
 #[allow(async_fn_in_trait)]
 pub trait Bus: Send + Sync {
     type Message: Clone + Send + 'static;
+    type Subscription: Stream<Item = Self::Message> + Send + Unpin + 'static;
 
     /// Route and deliver an already-constructed message to local subscribers.
-    async fn dispatch(
-        &self,
-        subject: &str,
-        msg: Self::Message,
-    ) -> Result<(), BusError>;
+    async fn dispatch(&self, subject: &str, msg: Self::Message) -> Result<(), BusError>;
 
-    async fn subscribe(&self, pattern: &str) -> Result<BusStream<Self::Message>, BusError>;
+    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError>;
     async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError>;
-    async fn consume(&self, queue: &str) -> Result<BusStream<Self::Message>, BusError>;
+    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError>;
 }

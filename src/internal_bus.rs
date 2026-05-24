@@ -1,13 +1,14 @@
+use crate::bus::{Bus, BusStream};
+use crate::errors::BusError;
+use crate::internal_router::InternalRouter;
+use crate::message::{AnyMessage, Envelope};
+use crate::routing::{ConsumerId, SubjectRouter};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
-use crate::bus::{Bus, BusStream};
-use crate::errors::BusError;
-use crate::message::{AnyMessage, Envelope};
-use crate::routing::{ConsumerId, SubjectRouter};
 
 pub struct InternalBus {
     router: Mutex<SubjectRouter>,
@@ -46,42 +47,20 @@ impl InternalBus {
     }
 }
 
+impl InternalRouter for InternalBus {
+    type Message = AnyMessage;
+}
+
 impl Bus for InternalBus {
     type Message = AnyMessage;
+    type Subscription = BusStream<AnyMessage>;
 
     async fn dispatch(&self, subject: &str, msg: AnyMessage) -> Result<(), BusError> {
-        let targets = self.router.lock().await.route(subject);
-
-        let mut to_send: Vec<(ConsumerId, mpsc::Sender<AnyMessage>)> = Vec::new();
-        {
-            let senders = self.senders.lock().await;
-            for id in &targets {
-                if let Some(tx) = senders.get(id) {
-                    to_send.push((*id, tx.clone()));
-                }
-            }
-        }
-
-        let mut dead: Vec<ConsumerId> = Vec::new();
-        for (id, tx) in to_send {
-            if tx.send(msg.clone()).await.is_err() {
-                dead.push(id);
-            }
-        }
-
-        if !dead.is_empty() {
-            let mut router = self.router.lock().await;
-            let mut senders = self.senders.lock().await;
-            for id in dead {
-                router.remove_consumer(id);
-                senders.remove(&id);
-            }
-        }
-
-        Ok(())
+        self.dispatch_internal(&self.router, &self.senders, subject, msg)
+            .await
     }
 
-    async fn subscribe(&self, pattern: &str) -> Result<BusStream<AnyMessage>, BusError> {
+    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
         let (tx, rx) = mpsc::channel(128);
         let id = self.router.lock().await.add_fanout(pattern);
         self.senders.lock().await.insert(id, tx);
@@ -92,7 +71,7 @@ impl Bus for InternalBus {
         self.router.lock().await.bind_queue(pattern, queue)
     }
 
-    async fn consume(&self, queue: &str) -> Result<BusStream<AnyMessage>, BusError> {
+    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
         let (tx, rx) = mpsc::channel(128);
         let id = self.router.lock().await.add_consumer(queue)?;
         self.senders.lock().await.insert(id, tx);

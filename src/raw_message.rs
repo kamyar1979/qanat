@@ -1,8 +1,8 @@
-use bytes::Bytes;
-use serde::de::DeserializeOwned;
 use crate::codec::Codec;
 use crate::errors::BusError;
 use crate::message::Envelope;
+use bytes::Bytes;
+use serde::de::DeserializeOwned;
 
 /// Byte-payload message used by external buses (NNG, Redis, NATS, …).
 /// The payload is opaque bytes; callers decode with their chosen `Codec`.

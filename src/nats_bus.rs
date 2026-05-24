@@ -1,13 +1,15 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
-use futures::StreamExt;
+use futures::Stream;
 use serde::Serialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
-use crate::bus::{Bus, BusStream};
+use crate::bus::Bus;
 use crate::codec::Codec;
 use crate::errors::BusError;
 use crate::message::Envelope;
@@ -50,16 +52,16 @@ impl<C: Codec> NatsBus<C> {
         if let Some(hdrs) = headers {
             let mut header_map = async_nats::header::HeaderMap::new();
             for (k, v) in hdrs {
-                let name: async_nats::header::HeaderName = k
-                    .parse()
-                    .map_err(|e: async_nats::header::ParseHeaderNameError| {
-                        BusError::Internal(e.to_string())
-                    })?;
-                let value: async_nats::header::HeaderValue = v
-                    .parse()
-                    .map_err(|e: async_nats::header::ParseHeaderValueError| {
-                        BusError::Internal(e.to_string())
-                    })?;
+                let name: async_nats::header::HeaderName =
+                    k.parse()
+                        .map_err(|e: async_nats::header::ParseHeaderNameError| {
+                            BusError::Internal(e.to_string())
+                        })?;
+                let value: async_nats::header::HeaderValue =
+                    v.parse()
+                        .map_err(|e: async_nats::header::ParseHeaderValueError| {
+                            BusError::Internal(e.to_string())
+                        })?;
                 header_map.insert(name, value);
             }
             self.client
@@ -80,7 +82,12 @@ impl<C: Codec> NatsBus<C> {
 fn nats_msg_to_raw(msg: async_nats::Message, id: u64) -> RawMessage {
     let headers = msg.headers.map(|h| {
         h.iter()
-            .map(|(k, vs)| (k.to_string(), vs.first().map(|v| v.to_string()).unwrap_or_default()))
+            .map(|(k, vs)| {
+                (
+                    k.to_string(),
+                    vs.first().map(|v| v.to_string()).unwrap_or_default(),
+                )
+            })
             .collect::<HashMap<String, String>>()
     });
     RawMessage {
@@ -95,24 +102,35 @@ fn nats_msg_to_raw(msg: async_nats::Message, id: u64) -> RawMessage {
     }
 }
 
-fn subscriber_to_stream(
-    mut sub: async_nats::Subscriber,
+pub struct NatsStream {
+    sub: async_nats::Subscriber,
     next_id: Arc<AtomicU64>,
-) -> BusStream<RawMessage> {
-    let (tx, rx) = mpsc::channel(128);
-    tokio::spawn(async move {
-        while let Some(msg) = sub.next().await {
-            let id = next_id.fetch_add(1, Ordering::Relaxed);
-            if tx.send(nats_msg_to_raw(msg, id)).await.is_err() {
-                break;
+}
+
+impl NatsStream {
+    fn new(sub: async_nats::Subscriber, next_id: Arc<AtomicU64>) -> Self {
+        Self { sub, next_id }
+    }
+}
+
+impl Stream for NatsStream {
+    type Item = RawMessage;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<RawMessage>> {
+        match Pin::new(&mut self.sub).poll_next(cx) {
+            Poll::Ready(Some(msg)) => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Some(nats_msg_to_raw(msg, id)))
             }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
-    });
-    BusStream::new(rx)
+    }
 }
 
 impl<C: Codec + 'static> Bus for NatsBus<C> {
     type Message = RawMessage;
+    type Subscription = NatsStream;
 
     /// Forward the raw bytes directly into NATS — the server routes from there.
     async fn dispatch(&self, subject: &str, msg: RawMessage) -> Result<(), BusError> {
@@ -123,13 +141,13 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
         Ok(())
     }
 
-    async fn subscribe(&self, pattern: &str) -> Result<BusStream<RawMessage>, BusError> {
+    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
         let sub = self
             .client
             .subscribe(pattern.to_string())
             .await
             .map_err(|e| BusError::Backend(Box::new(e)))?;
-        Ok(subscriber_to_stream(sub, Arc::clone(&self.next_msg_id)))
+        Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 
     async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError> {
@@ -147,7 +165,7 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
         }
     }
 
-    async fn consume(&self, queue: &str) -> Result<BusStream<RawMessage>, BusError> {
+    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
         let pattern = {
             let queues = self.queues.lock().await;
             queues
@@ -160,7 +178,7 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
             .queue_subscribe(pattern, queue.to_string())
             .await
             .map_err(|e| BusError::Backend(Box::new(e)))?;
-        Ok(subscriber_to_stream(sub, Arc::clone(&self.next_msg_id)))
+        Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 }
 
@@ -229,7 +247,9 @@ mod tests {
         let bus = nats_bus!();
         let mut sub = bus.subscribe("orders.>").await.unwrap();
 
-        bus.publish("orders.placed.eu", &"order-1", None).await.unwrap();
+        bus.publish("orders.placed.eu", &"order-1", None)
+            .await
+            .unwrap();
 
         let msg = timeout(Duration::from_millis(500), sub.next())
             .await
@@ -283,7 +303,10 @@ mod tests {
     #[tokio::test]
     async fn test_nats_consume_nonexistent_queue_returns_error() {
         let bus = nats_bus!();
-        assert!(matches!(bus.consume("ghost").await, Err(BusError::QueueNotFound(_))));
+        assert!(matches!(
+            bus.consume("ghost").await,
+            Err(BusError::QueueNotFound(_))
+        ));
     }
 
     #[tokio::test]

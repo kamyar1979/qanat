@@ -2,6 +2,7 @@ pub mod bus;
 pub mod codec;
 pub mod errors;
 pub mod internal_bus;
+pub(crate) mod internal_router;
 pub(crate) mod message;
 pub mod nats_bus;
 pub mod nng_bus;
@@ -22,7 +23,10 @@ mod tests {
 
     static NNG_URL_COUNTER: AtomicU64 = AtomicU64::new(1);
     fn nng_url() -> String {
-        format!("inproc://qanat-test-{}", NNG_URL_COUNTER.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "inproc://qanat-test-{}",
+            NNG_URL_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     // ── wildcard: > ──────────────────────────────────────────────────────────
@@ -86,14 +90,20 @@ mod tests {
     #[tokio::test]
     async fn test_consume_nonexistent_queue_returns_error() {
         let bus = InternalBus::new();
-        assert!(matches!(bus.consume("ghost").await, Err(BusError::QueueNotFound(_))));
+        assert!(matches!(
+            bus.consume("ghost").await,
+            Err(BusError::QueueNotFound(_))
+        ));
     }
 
     #[tokio::test]
     async fn test_bind_queue_conflicting_pattern_returns_error() {
         let bus = InternalBus::new();
         bus.bind_queue("jobs.*", "workers").await.unwrap();
-        assert!(matches!(bus.bind_queue("tasks.*", "workers").await, Err(BusError::Internal(_))));
+        assert!(matches!(
+            bus.bind_queue("tasks.*", "workers").await,
+            Err(BusError::Internal(_))
+        ));
     }
 
     #[tokio::test]
@@ -133,7 +143,9 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_subscription_does_not_affect_later_publishes() {
         let bus = InternalBus::new();
-        { let _sub = bus.subscribe("foo.bar").await.unwrap(); }
+        {
+            let _sub = bus.subscribe("foo.bar").await.unwrap();
+        }
         assert!(bus.publish("foo.bar", 1u32, None).await.is_ok());
     }
 
@@ -147,8 +159,20 @@ mod tests {
 
         bus.publish("foo.bar", 123u32, None).await.unwrap();
 
-        let v1 = *sub1.next().await.unwrap().downcast::<u32>().unwrap().payload;
-        let v2 = *sub2.next().await.unwrap().downcast::<u32>().unwrap().payload;
+        let v1 = *sub1
+            .next()
+            .await
+            .unwrap()
+            .downcast::<u32>()
+            .unwrap()
+            .payload;
+        let v2 = *sub2
+            .next()
+            .await
+            .unwrap()
+            .downcast::<u32>()
+            .unwrap()
+            .payload;
 
         assert_eq!(v1, 123);
         assert_eq!(v2, 123);
@@ -192,7 +216,9 @@ mod tests {
         bus.publish("events.login", &42u32, None).await.unwrap();
 
         let msg = timeout(Duration::from_millis(200), sub.next())
-            .await.expect("timed out").expect("stream ended");
+            .await
+            .expect("timed out")
+            .expect("stream ended");
         assert_eq!(msg.decode_json::<u32>().unwrap(), 42);
     }
 
@@ -200,17 +226,22 @@ mod tests {
     async fn test_nng_two_nodes_exchange_messages() {
         let url = nng_url();
         let listener = NngBus::listen(JsonCodec, &url).unwrap();
-        let dialer   = NngBus::dial(JsonCodec, &url).unwrap();
+        let dialer = NngBus::dial(JsonCodec, &url).unwrap();
 
         // Let the connection establish before subscribing / publishing
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let mut sub = listener.subscribe("orders.>").await.unwrap();
 
-        dialer.publish("orders.placed", &"order-1", None).await.unwrap();
+        dialer
+            .publish("orders.placed", &"order-1", None)
+            .await
+            .unwrap();
 
         let msg = timeout(Duration::from_millis(200), sub.next())
-            .await.expect("timed out").expect("stream ended");
+            .await
+            .expect("timed out")
+            .expect("stream ended");
         assert_eq!(msg.decode_json::<String>().unwrap(), "order-1");
     }
 
@@ -218,21 +249,29 @@ mod tests {
     async fn test_nng_wildcard_routing_across_nodes() {
         let url = nng_url();
         let listener = NngBus::listen(JsonCodec, &url).unwrap();
-        let dialer   = NngBus::dial(JsonCodec, &url).unwrap();
+        let dialer = NngBus::dial(JsonCodec, &url).unwrap();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let mut sub_all  = listener.subscribe(">").await.unwrap();
-        let mut sub_foo  = listener.subscribe("foo.*").await.unwrap();
-        let mut sub_bar  = listener.subscribe("bar.>").await.unwrap();
+        let mut sub_all = listener.subscribe(">").await.unwrap();
+        let mut sub_foo = listener.subscribe("foo.*").await.unwrap();
+        let mut sub_bar = listener.subscribe("bar.>").await.unwrap();
 
         dialer.publish("foo.x", &1u32, None).await.unwrap();
 
         // sub_all and sub_foo match; sub_bar does not
         let v1 = timeout(Duration::from_millis(200), sub_all.next())
-            .await.expect("timed out").unwrap().decode_json::<u32>().unwrap();
+            .await
+            .expect("timed out")
+            .unwrap()
+            .decode_json::<u32>()
+            .unwrap();
         let v2 = timeout(Duration::from_millis(200), sub_foo.next())
-            .await.expect("timed out").unwrap().decode_json::<u32>().unwrap();
+            .await
+            .expect("timed out")
+            .unwrap()
+            .decode_json::<u32>()
+            .unwrap();
         assert_eq!(v1, 1);
         assert_eq!(v2, 1);
 
@@ -244,7 +283,7 @@ mod tests {
     async fn test_nng_queue_group_across_nodes() {
         let url = nng_url();
         let listener = NngBus::listen(JsonCodec, &url).unwrap();
-        let dialer   = NngBus::dial(JsonCodec, &url).unwrap();
+        let dialer = NngBus::dial(JsonCodec, &url).unwrap();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -256,9 +295,17 @@ mod tests {
         dialer.publish("jobs.b", &2u32, None).await.unwrap();
 
         let m1 = timeout(Duration::from_millis(200), c1.next())
-            .await.expect("timed out").unwrap().decode_json::<u32>().unwrap();
+            .await
+            .expect("timed out")
+            .unwrap()
+            .decode_json::<u32>()
+            .unwrap();
         let m2 = timeout(Duration::from_millis(200), c2.next())
-            .await.expect("timed out").unwrap().decode_json::<u32>().unwrap();
+            .await
+            .expect("timed out")
+            .unwrap()
+            .decode_json::<u32>()
+            .unwrap();
 
         assert!(m1 == 1 || m1 == 2);
         assert!(m2 == 1 || m2 == 2);

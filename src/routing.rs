@@ -19,7 +19,10 @@ pub(crate) struct SubjectRouter {
 
 impl SubjectRouter {
     pub fn new() -> Self {
-        Self { bindings: Vec::new(), next_id: 1 }
+        Self {
+            bindings: Vec::new(),
+            next_id: 1,
+        }
     }
 
     fn alloc_id(&mut self) -> ConsumerId {
@@ -65,7 +68,11 @@ impl SubjectRouter {
     }
 
     pub fn bind_queue(&mut self, pattern: &str, queue: &str) -> Result<(), BusError> {
-        if let Some(b) = self.bindings.iter_mut().find(|b| b.queue.as_deref() == Some(queue)) {
+        if let Some(b) = self
+            .bindings
+            .iter_mut()
+            .find(|b| b.queue.as_deref() == Some(queue))
+        {
             if b.subject_pattern != pattern {
                 return Err(BusError::Internal(format!(
                     "queue '{}' is already bound to pattern '{}'",
@@ -87,7 +94,8 @@ impl SubjectRouter {
 
     pub fn add_consumer(&mut self, queue: &str) -> Result<ConsumerId, BusError> {
         let id = self.alloc_id();
-        let binding = self.bindings
+        let binding = self
+            .bindings
             .iter_mut()
             .find(|b| b.queue.as_deref() == Some(queue))
             .ok_or_else(|| BusError::QueueNotFound(queue.to_string()))?;
@@ -124,6 +132,7 @@ impl SubjectRouter {
         for binding in self.bindings.iter_mut() {
             binding.consumers.retain(|&c| c != id);
         }
-        self.bindings.retain(|b| b.queue.is_some() || !b.consumers.is_empty());
+        self.bindings
+            .retain(|b| b.queue.is_some() || !b.consumers.is_empty());
     }
 }

@@ -38,8 +38,14 @@ pub struct Message<T> {
 impl AnyMessage {
     pub fn downcast<T: Send + Sync + 'static>(self) -> Result<Message<T>, Self> {
         match self.payload.downcast::<T>() {
-            Ok(arc_t) => Ok(Message { envelope: self.envelope, payload: arc_t }),
-            Err(arc_any) => Err(AnyMessage { envelope: self.envelope, payload: arc_any }),
+            Ok(arc_t) => Ok(Message {
+                envelope: self.envelope,
+                payload: arc_t,
+            }),
+            Err(arc_any) => Err(AnyMessage {
+                envelope: self.envelope,
+                payload: arc_any,
+            }),
         }
     }
 }

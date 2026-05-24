@@ -1,3 +1,10 @@
+use crate::bus::{Bus, BusStream};
+use crate::codec::Codec;
+use crate::errors::BusError;
+use crate::internal_router::InternalRouter;
+use crate::message::Envelope;
+use crate::raw_message::RawMessage;
+use crate::routing::{ConsumerId, SubjectRouter};
 use bytes::Bytes;
 use nng::{Protocol, Socket};
 use serde::Serialize;
@@ -6,12 +13,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
-use crate::bus::{Bus, BusStream};
-use crate::codec::Codec;
-use crate::errors::BusError;
-use crate::message::Envelope;
-use crate::raw_message::RawMessage;
-use crate::routing::{ConsumerId, SubjectRouter};
 
 // ── wire framing ─────────────────────────────────────────────────────────────
 // Layout: [4 bytes BE: subject_len][subject UTF-8][payload bytes]
@@ -50,35 +51,15 @@ struct Inner<C: Codec> {
 }
 
 impl<C: Codec> Inner<C> {
-    async fn dispatch_local(&self, msg: RawMessage) {
-        let targets = self.router.lock().await.route(&msg.envelope.subject);
-
-        let mut to_send: Vec<(ConsumerId, mpsc::Sender<RawMessage>)> = Vec::new();
-        {
-            let senders = self.senders.lock().await;
-            for id in &targets {
-                if let Some(tx) = senders.get(id) {
-                    to_send.push((*id, tx.clone()));
-                }
-            }
-        }
-
-        let mut dead: Vec<ConsumerId> = Vec::new();
-        for (id, tx) in to_send {
-            if tx.send(msg.clone()).await.is_err() {
-                dead.push(id);
-            }
-        }
-
-        if !dead.is_empty() {
-            let mut router = self.router.lock().await;
-            let mut senders = self.senders.lock().await;
-            for id in dead {
-                router.remove_consumer(id);
-                senders.remove(&id);
-            }
-        }
+    async fn dispatch_local(&self, msg: RawMessage) -> Result<(), BusError> {
+        let subject = msg.envelope.subject.clone();
+        self.dispatch_internal(&self.router, &self.senders, &subject, msg)
+            .await
     }
+}
+
+impl<C: Codec> InternalRouter for Inner<C> {
+    type Message = RawMessage;
 }
 
 // ── NngBus ────────────────────────────────────────────────────────────────────
@@ -101,14 +82,16 @@ impl<C: Codec + 'static> NngBus<C> {
     }
 
     fn create(codec: C, url: &str, listen: bool) -> Result<Self, BusError> {
-        let socket = Socket::new(Protocol::Bus0)
-            .map_err(|e| BusError::Connection(e.to_string()))?;
+        let socket =
+            Socket::new(Protocol::Bus0).map_err(|e| BusError::Connection(e.to_string()))?;
 
         if listen {
-            socket.listen(url)
+            socket
+                .listen(url)
                 .map_err(|e| BusError::Connection(e.to_string()))?;
         } else {
-            socket.dial(url)
+            socket
+                .dial(url)
                 .map_err(|e| BusError::Connection(e.to_string()))?;
         }
 
@@ -130,22 +113,24 @@ impl<C: Codec + 'static> NngBus<C> {
         let (bridge_tx, mut bridge_rx) = mpsc::channel::<(String, Bytes)>(256);
 
         let inner_recv = Arc::clone(&inner);
-        std::thread::spawn(move || loop {
-            match inner_recv.socket.recv() {
-                Ok(msg) => {
-                    if let Some((subject, payload)) = decode_wire(&msg) {
-                        if bridge_tx
-                            .blocking_send((
-                                subject.to_string(),
-                                Bytes::copy_from_slice(payload),
-                            ))
-                            .is_err()
-                        {
-                            break; // tokio side dropped
+        std::thread::spawn(move || {
+            loop {
+                match inner_recv.socket.recv() {
+                    Ok(msg) => {
+                        if let Some((subject, payload)) = decode_wire(&msg) {
+                            if bridge_tx
+                                .blocking_send((
+                                    subject.to_string(),
+                                    Bytes::copy_from_slice(payload),
+                                ))
+                                .is_err()
+                            {
+                                break; // tokio side dropped
+                            }
                         }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
         });
 
@@ -161,7 +146,7 @@ impl<C: Codec + 'static> NngBus<C> {
                     },
                     payload,
                 };
-                inner.dispatch_local(msg).await;
+                let _ = inner.dispatch_local(msg).await;
             }
         });
     }
@@ -192,7 +177,7 @@ impl<C: Codec + 'static> NngBus<C> {
             },
             payload: payload_bytes,
         };
-        self.inner.dispatch_local(raw_msg).await;
+        self.inner.dispatch_local(raw_msg).await?;
 
         Ok(())
     }
@@ -200,14 +185,14 @@ impl<C: Codec + 'static> NngBus<C> {
 
 impl<C: Codec> Bus for NngBus<C> {
     type Message = RawMessage;
+    type Subscription = BusStream<RawMessage>;
 
     /// Route `msg` to local subscribers only. For network delivery use `publish`.
     async fn dispatch(&self, _subject: &str, msg: RawMessage) -> Result<(), BusError> {
-        self.inner.dispatch_local(msg).await;
-        Ok(())
+        self.inner.dispatch_local(msg).await
     }
 
-    async fn subscribe(&self, pattern: &str) -> Result<BusStream<RawMessage>, BusError> {
+    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
         let (tx, rx) = mpsc::channel(128);
         let id = self.inner.router.lock().await.add_fanout(pattern);
         self.inner.senders.lock().await.insert(id, tx);
@@ -218,7 +203,7 @@ impl<C: Codec> Bus for NngBus<C> {
         self.inner.router.lock().await.bind_queue(pattern, queue)
     }
 
-    async fn consume(&self, queue: &str) -> Result<BusStream<RawMessage>, BusError> {
+    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
         let (tx, rx) = mpsc::channel(128);
         let id = self.inner.router.lock().await.add_consumer(queue)?;
         self.inner.senders.lock().await.insert(id, tx);
