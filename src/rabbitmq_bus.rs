@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::bus::Bus;
 use crate::codec::{Codec, JsonCodec};
-use crate::errors::BusError;
+use crate::errors::{BackendError, BusError};
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
 
@@ -58,7 +58,7 @@ impl<C: Codec> RabbitMqBus<C> {
                 FieldTable::default(),
             )
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
 
         Ok(Self {
             _connection: connection,
@@ -95,9 +95,9 @@ impl<C: Codec> RabbitMqBus<C> {
                 headers_to_properties(headers),
             )
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
         Ok(())
     }
 
@@ -109,7 +109,7 @@ impl<C: Codec> RabbitMqBus<C> {
                 FieldTable::default(),
             )
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))
     }
 
     async fn consume_queue(&self, queue: &str) -> Result<RabbitMqStream, BusError> {
@@ -125,7 +125,7 @@ impl<C: Codec> RabbitMqBus<C> {
                 FieldTable::default(),
             )
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
         Ok(RabbitMqStream::new(consumer, Arc::clone(&self.next_msg_id)))
     }
 }
@@ -152,7 +152,7 @@ impl<C: Codec + 'static> Bus for RabbitMqBus<C> {
                 FieldTable::default(),
             )
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
 
         self.consume_queue(queue.name().as_str()).await
     }
@@ -186,7 +186,7 @@ impl<C: Codec + 'static> Bus for RabbitMqBus<C> {
             .await
         {
             self.queues.lock().await.remove(queue);
-            return Err(BusError::Backend(Box::new(err)));
+            return Err(BusError::Backend(BackendError::RabbitMq(err)));
         }
 
         if let Err(err) = self
@@ -201,7 +201,7 @@ impl<C: Codec + 'static> Bus for RabbitMqBus<C> {
             .await
         {
             self.queues.lock().await.remove(queue);
-            return Err(BusError::Backend(Box::new(err)));
+            return Err(BusError::Backend(BackendError::RabbitMq(err)));
         }
 
         Ok(())

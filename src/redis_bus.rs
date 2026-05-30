@@ -1,6 +1,6 @@
 use crate::bus::{Bus, BusStream};
 use crate::codec::{Codec, JsonCodec};
-use crate::errors::BusError;
+use crate::errors::{BackendError, BusError};
 use crate::local_router::LocalRouter;
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
@@ -48,7 +48,7 @@ impl<C: Codec + 'static> RedisBus<C> {
         pubsub
             .subscribe(channel)
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::Redis(e)))?;
 
         let inner = Arc::new(RedisState {
             local: LocalRouter::new(codec),
@@ -100,7 +100,7 @@ impl<C: Codec + 'static> RedisBus<C> {
             .arg(wire)
             .query_async::<()>(&mut *publisher)
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))
+            .map_err(|e| BusError::Backend(BackendError::Redis(e)))
     }
 }
 

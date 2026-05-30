@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::bus::Bus;
 use crate::codec::{Codec, JsonCodec};
-use crate::errors::BusError;
+use crate::errors::{BackendError, BusError};
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
 
@@ -67,12 +67,12 @@ impl<C: Codec> NatsBus<C> {
             self.client
                 .publish_with_headers(subject.to_string(), header_map, payload_bytes)
                 .await
-                .map_err(|e| BusError::Backend(Box::new(e)))?;
+                .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
         } else {
             self.client
                 .publish(subject.to_string(), payload_bytes)
                 .await
-                .map_err(|e| BusError::Backend(Box::new(e)))?;
+                .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
         }
 
         Ok(())
@@ -137,7 +137,7 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
         self.client
             .publish(subject.to_string(), msg.payload)
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
         Ok(())
     }
 
@@ -146,7 +146,7 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
             .client
             .subscribe(pattern.to_string())
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::NatsSubscribe(e)))?;
         Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 
@@ -177,7 +177,7 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
             .client
             .queue_subscribe(pattern, queue.to_string())
             .await
-            .map_err(|e| BusError::Backend(Box::new(e)))?;
+            .map_err(|e| BusError::Backend(BackendError::NatsSubscribe(e)))?;
         Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 }
