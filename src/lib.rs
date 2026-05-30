@@ -10,6 +10,8 @@ pub(crate) mod message;
 pub mod nats_bus;
 #[cfg(feature = "nng")]
 pub mod nng_bus;
+#[cfg(feature = "rabbitmq")]
+pub mod rabbitmq_bus;
 pub mod raw_message;
 #[cfg(feature = "redis")]
 pub mod redis_bus;
