@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::bus::Bus;
-use crate::codec::Codec;
+use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
@@ -19,7 +19,7 @@ use crate::raw_message::RawMessage;
 // NATS server handles all wildcard matching, fanout, and queue groups natively.
 // SubjectRouter is NOT used here.
 
-pub struct NatsBus<C: Codec> {
+pub struct NatsBus<C: Codec = JsonCodec> {
     client: async_nats::Client,
     codec: C,
     /// Maps queue name → subject pattern; needed so `consume` can call
