@@ -1,23 +1,25 @@
 pub mod bus;
-pub mod codec;
 pub mod errors;
-pub mod internal_bus;
-pub(crate) mod internal_router;
-#[cfg(any(feature = "nng", feature = "redis"))]
-pub(crate) mod local_router;
-pub(crate) mod message;
-#[cfg(feature = "nats")]
-pub mod nats_bus;
-#[cfg(feature = "nng")]
-pub mod nng_bus;
-#[cfg(feature = "rabbitmq")]
-pub mod rabbitmq_bus;
-pub mod raw_message;
-#[cfg(feature = "redis")]
-pub mod redis_bus;
+pub mod router;
 pub(crate) mod routing;
+
+pub use bus::codec;
+pub use bus::internal_bus;
+pub(crate) use bus::internal_router;
 #[cfg(any(feature = "nng", feature = "redis"))]
-pub(crate) mod wire;
+pub(crate) use bus::local_router;
+pub(crate) use bus::message;
+#[cfg(feature = "nats")]
+pub use bus::nats_bus;
+#[cfg(feature = "nng")]
+pub use bus::nng_bus;
+#[cfg(feature = "rabbitmq")]
+pub use bus::rabbitmq_bus;
+pub use bus::raw_message;
+#[cfg(feature = "redis")]
+pub use bus::redis_bus;
+#[cfg(any(feature = "nng", feature = "redis"))]
+pub(crate) use bus::wire;
 
 #[cfg(test)]
 mod tests {
