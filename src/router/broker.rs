@@ -4,6 +4,57 @@ use std::time::Duration;
 pub const DEFAULT_REDELIVERY_MESSAGE_DELAY: Duration = Duration::from_secs(5);
 pub const DEFAULT_MESSAGE_RETRIES: usize = 3;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BrokerSubject {
+    pub subject: String,
+}
+
+impl BrokerSubject {
+    pub fn new(subject: impl Into<String>) -> Self {
+        Self {
+            subject: subject.into(),
+        }
+    }
+}
+
+pub struct BrokerRouter<B> {
+    bus: B,
+}
+
+impl<B> BrokerRouter<B> {
+    pub fn new(bus: B) -> Self {
+        Self { bus }
+    }
+
+    pub fn bind(self, pattern: impl Into<String>, queue: impl Into<String>) -> BrokerEndpoint<B> {
+        BrokerEndpoint {
+            router: self,
+            pattern: Some(pattern.into()),
+            queue: queue.into(),
+        }
+    }
+
+    pub fn consume(self, queue: impl Into<String>) -> BrokerEndpoint<B> {
+        BrokerEndpoint {
+            router: self,
+            pattern: None,
+            queue: queue.into(),
+        }
+    }
+}
+
+pub struct BrokerEndpoint<B> {
+    pub(crate) router: BrokerRouter<B>,
+    pub pattern: Option<String>,
+    pub queue: String,
+}
+
+impl<B> BrokerEndpoint<B> {
+    pub fn bus(&self) -> &B {
+        &self.router.bus
+    }
+}
+
 /// Configuration for a broker-backed router/server layer.
 ///
 /// This intentionally does not choose a serialization format. Qanat external
@@ -101,5 +152,14 @@ mod tests {
             Some("redis://127.0.0.1/1")
         );
         assert!(config.durability);
+    }
+
+    #[test]
+    fn broker_router_builds_broker_source_endpoint() {
+        let endpoint = BrokerRouter::new("bus").bind("orders.created", "orders.in");
+
+        assert_eq!(endpoint.pattern.as_deref(), Some("orders.created"));
+        assert_eq!(endpoint.queue, "orders.in");
+        assert_eq!(endpoint.bus(), &"bus");
     }
 }
