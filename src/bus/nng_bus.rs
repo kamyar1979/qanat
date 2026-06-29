@@ -146,14 +146,14 @@ impl<C: Codec> Bus for NngBus<C> {
     }
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
-        Ok(self.inner.local.subscribe(pattern).await)
+        self.inner.local.subscribe(pattern).await
     }
 
-    async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError> {
-        self.inner.local.bind_queue(pattern, queue).await
-    }
-
-    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
-        self.inner.local.consume(queue).await
+    async fn subscribe_group(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::Subscription, BusError> {
+        self.inner.local.subscribe_group(pattern, group).await
     }
 }

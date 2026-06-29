@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use futures::Stream;
 use serde::Serialize;
-use tokio::sync::Mutex;
 
 use crate::bus::Bus;
 use crate::codec::{Codec, JsonCodec};
@@ -22,9 +21,6 @@ use crate::raw_message::RawMessage;
 pub struct NatsBus<C: Codec = JsonCodec> {
     client: async_nats::Client,
     codec: C,
-    /// Maps queue name → subject pattern; needed so `consume` can call
-    /// `queue_subscribe(pattern, queue)` when the caller only knows the queue name.
-    queues: Mutex<HashMap<String, String>>,
     next_msg_id: Arc<AtomicU64>,
 }
 
@@ -36,7 +32,6 @@ impl<C: Codec> NatsBus<C> {
         Ok(Self {
             client,
             codec,
-            queues: Mutex::new(HashMap::new()),
             next_msg_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -150,32 +145,14 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
         Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 
-    async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError> {
-        let mut queues = self.queues.lock().await;
-        match queues.get(queue) {
-            Some(existing) if existing.as_str() == pattern => Ok(()),
-            Some(existing) => Err(BusError::Internal(format!(
-                "queue '{}' already bound to pattern '{}', cannot rebind to '{}'",
-                queue, existing, pattern
-            ))),
-            None => {
-                queues.insert(queue.to_string(), pattern.to_string());
-                Ok(())
-            }
-        }
-    }
-
-    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
-        let pattern = {
-            let queues = self.queues.lock().await;
-            queues
-                .get(queue)
-                .ok_or_else(|| BusError::QueueNotFound(queue.to_string()))?
-                .clone()
-        };
+    async fn subscribe_group(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::Subscription, BusError> {
         let sub = self
             .client
-            .queue_subscribe(pattern, queue.to_string())
+            .queue_subscribe(pattern.to_string(), group.to_string())
             .await
             .map_err(|e| BusError::Backend(BackendError::NatsSubscribe(e)))?;
         Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
@@ -261,9 +238,8 @@ mod tests {
     #[tokio::test]
     async fn test_nats_queue_group_round_robin() {
         let bus = nats_bus!();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        let mut c1 = bus.consume("workers").await.unwrap();
-        let mut c2 = bus.consume("workers").await.unwrap();
+        let mut c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        let mut c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
 
         bus.publish("jobs.a", &1u32, None).await.unwrap();
         bus.publish("jobs.b", &2u32, None).await.unwrap();
@@ -287,26 +263,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nats_bind_queue_idempotent() {
+    async fn test_nats_subscribe_group_same_pattern_is_allowed() {
         let bus = nats_bus!();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        assert!(bus.bind_queue("jobs.*", "workers").await.is_ok());
+        let _c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        assert!(bus.subscribe_group("jobs.*", "workers").await.is_ok());
     }
 
     #[tokio::test]
-    async fn test_nats_bind_queue_conflict_returns_error() {
+    async fn test_nats_same_group_can_subscribe_to_different_patterns() {
         let bus = nats_bus!();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        assert!(bus.bind_queue("tasks.*", "workers").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_nats_consume_nonexistent_queue_returns_error() {
-        let bus = nats_bus!();
-        assert!(matches!(
-            bus.consume("ghost").await,
-            Err(BusError::QueueNotFound(_))
-        ));
+        let _c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        assert!(bus.subscribe_group("tasks.*", "workers").await.is_ok());
     }
 
     #[tokio::test]

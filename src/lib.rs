@@ -1,5 +1,6 @@
 pub mod bus;
 pub mod errors;
+pub mod http;
 pub mod router;
 pub(crate) mod routing;
 
@@ -82,44 +83,33 @@ mod tests {
     // ── queue group edge cases ────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_publish_to_queue_with_no_consumers_does_not_panic() {
+    async fn test_publish_with_no_group_subscribers_does_not_panic() {
         let bus = InternalBus::new();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
         assert!(bus.publish("jobs.run", "task", None).await.is_ok());
     }
 
     #[tokio::test]
-    async fn test_consume_nonexistent_queue_returns_error() {
+    async fn test_subscribe_group_conflicting_pattern_returns_error() {
         let bus = InternalBus::new();
+        let _sub = bus.subscribe_group("jobs.*", "workers").await.unwrap();
         assert!(matches!(
-            bus.consume("ghost").await,
-            Err(BusError::QueueNotFound(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_bind_queue_conflicting_pattern_returns_error() {
-        let bus = InternalBus::new();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        assert!(matches!(
-            bus.bind_queue("tasks.*", "workers").await,
+            bus.subscribe_group("tasks.*", "workers").await,
             Err(BusError::Internal(_))
         ));
     }
 
     #[tokio::test]
-    async fn test_bind_queue_same_pattern_is_idempotent() {
+    async fn test_subscribe_group_same_pattern_is_idempotent() {
         let bus = InternalBus::new();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        assert!(bus.bind_queue("jobs.*", "workers").await.is_ok());
+        let _sub = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        assert!(bus.subscribe_group("jobs.*", "workers").await.is_ok());
     }
 
     #[tokio::test]
     async fn test_queue_group_round_robin_cycles() {
         let bus = InternalBus::new();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        let mut c1 = bus.consume("workers").await.unwrap();
-        let mut c2 = bus.consume("workers").await.unwrap();
+        let mut c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        let mut c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
 
         for i in 1u32..=4 {
             bus.publish("jobs.task", i, None).await.unwrap();
@@ -182,9 +172,8 @@ mod tests {
     #[tokio::test]
     async fn test_queue_group_round_robin() {
         let bus = InternalBus::new();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        let mut c1 = bus.consume("workers").await.unwrap();
-        let mut c2 = bus.consume("workers").await.unwrap();
+        let mut c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        let mut c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
 
         bus.publish("jobs.run", "A", None).await.unwrap();
         bus.publish("jobs.execute", "B", None).await.unwrap();
@@ -302,9 +291,8 @@ mod tests {
 
             tokio::time::sleep(Duration::from_millis(20)).await;
 
-            listener.bind_queue("jobs.*", "workers").await.unwrap();
-            let mut c1 = listener.consume("workers").await.unwrap();
-            let mut c2 = listener.consume("workers").await.unwrap();
+            let mut c1 = listener.subscribe_group("jobs.*", "workers").await.unwrap();
+            let mut c2 = listener.subscribe_group("jobs.*", "workers").await.unwrap();
 
             dialer.publish("jobs.a", &1u32, None).await.unwrap();
             dialer.publish("jobs.b", &2u32, None).await.unwrap();

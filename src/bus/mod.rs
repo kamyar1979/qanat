@@ -48,7 +48,7 @@ impl<M: Clone + Send + 'static> Stream for BusStream<M> {
 ///
 /// `Message` is the native payload carrier for a given backend:
 /// - `InternalBus` → `AnyMessage`  (typed, zero-copy, no serde)
-/// - `NngBus<C>` / `RedisBus<C>` → `RawMessage`  (bytes, decoded with `C`)
+/// - external buses → `RawMessage`  (bytes, decoded with `C`)
 ///
 /// Typed `publish` lives as an inherent method on each concrete type because the
 /// required bounds differ (`Any + Send + Sync` vs `Serialize`).
@@ -61,6 +61,9 @@ pub trait Bus: Send + Sync {
     async fn dispatch(&self, subject: &str, msg: Self::Message) -> Result<(), BusError>;
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError>;
-    async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError>;
-    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError>;
+    async fn subscribe_group(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::Subscription, BusError>;
 }

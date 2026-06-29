@@ -1,24 +1,35 @@
-pub struct App<R = ()> {
-    routers: R,
+/// An application component whose concrete type is erased when registered.
+///
+/// Lifecycle methods will be added when the concrete services are implemented.
+pub trait Service: Send {}
+
+pub struct App {
+    services: Vec<Box<dyn Service>>,
 }
 
-impl App<()> {
+impl App {
     pub fn new() -> Self {
-        Self { routers: () }
+        Self {
+            services: Vec::new(),
+        }
+    }
+
+    pub fn router<S>(mut self, service: S) -> Self
+    where
+        S: Service + 'static,
+    {
+        self.services.push(Box::new(service));
+        self
+    }
+
+    pub fn service_count(&self) -> usize {
+        self.services.len()
     }
 }
 
-impl Default for App<()> {
+impl Default for App {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl<R> App<R> {
-    pub fn router<N>(self, router: N) -> App<(R, N)> {
-        App {
-            routers: (self.routers, router),
-        }
     }
 }
 
@@ -69,22 +80,17 @@ impl<F, S, T> RouteBinding<F, S, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::router::{BrokerRouter, HttpRouter};
 
-    async fn create_order(_: u64) -> String {
-        "created".to_string()
-    }
+    struct HttpService;
+    impl Service for HttpService {}
 
-    #[derive(Clone)]
-    struct FakeBus;
+    struct BrokerService;
+    impl Service for BrokerService {}
 
     #[test]
-    fn app_composes_typed_route_bindings() {
-        let binding = bind(create_order)
-            .from(BrokerRouter::new(FakeBus).bind("orders.created", "orders.in"))
-            .to(HttpRouter::post("/orders"));
+    fn app_erases_heterogeneous_service_types() {
+        let app = App::new().router(HttpService).router(BrokerService);
 
-        let app = App::new().router(binding);
-        let _ = app;
+        assert_eq!(app.service_count(), 2);
     }
 }

@@ -16,7 +16,6 @@ use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind, Queue,
 };
 use serde::Serialize;
-use tokio::sync::Mutex;
 
 use crate::bus::Bus;
 use crate::codec::{Codec, JsonCodec};
@@ -33,7 +32,6 @@ pub struct RabbitMqBus<C: Codec = JsonCodec> {
     channel: Channel,
     exchange: String,
     codec: C,
-    queues: Mutex<HashMap<String, String>>,
     next_msg_id: Arc<AtomicU64>,
 }
 
@@ -65,7 +63,6 @@ impl<C: Codec> RabbitMqBus<C> {
             channel,
             exchange: exchange.to_string(),
             codec,
-            queues: Mutex::new(HashMap::new()),
             next_msg_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -157,65 +154,34 @@ impl<C: Codec + 'static> Bus for RabbitMqBus<C> {
         self.consume_queue(queue.name().as_str()).await
     }
 
-    async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError> {
+    async fn subscribe_group(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::Subscription, BusError> {
         let binding_key = rabbit_binding_key(pattern)?;
 
-        {
-            let mut queues = self.queues.lock().await;
-            match queues.get(queue) {
-                Some(existing) if existing.as_str() == pattern => return Ok(()),
-                Some(existing) => {
-                    return Err(BusError::Internal(format!(
-                        "queue '{}' already bound to pattern '{}', cannot rebind to '{}'",
-                        queue, existing, pattern
-                    )));
-                }
-                None => {
-                    queues.insert(queue.to_string(), pattern.to_string());
-                }
-            }
-        }
-
-        if let Err(err) = self
-            .channel
+        self.channel
             .queue_declare(
-                queue.into(),
+                group.into(),
                 QueueDeclareOptions::durable(),
                 FieldTable::default(),
             )
             .await
-        {
-            self.queues.lock().await.remove(queue);
-            return Err(BusError::Backend(BackendError::RabbitMq(err)));
-        }
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
 
-        if let Err(err) = self
-            .channel
+        self.channel
             .queue_bind(
-                queue.into(),
+                group.into(),
                 self.exchange.clone().into(),
                 binding_key.into(),
                 QueueBindOptions::default(),
                 FieldTable::default(),
             )
             .await
-        {
-            self.queues.lock().await.remove(queue);
-            return Err(BusError::Backend(BackendError::RabbitMq(err)));
-        }
+            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
 
-        Ok(())
-    }
-
-    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
-        {
-            let queues = self.queues.lock().await;
-            if !queues.contains_key(queue) {
-                return Err(BusError::QueueNotFound(queue.to_string()));
-            }
-        }
-
-        self.consume_queue(queue).await
+        self.consume_queue(group).await
     }
 }
 
@@ -463,9 +429,8 @@ mod tests {
     async fn test_rabbitmq_queue_group_round_robin() {
         let bus = rabbit_bus!();
         let queue = unique_name("queue");
-        bus.bind_queue("jobs.*", &queue).await.unwrap();
-        let mut c1 = bus.consume(&queue).await.unwrap();
-        let mut c2 = bus.consume(&queue).await.unwrap();
+        let mut c1 = bus.subscribe_group("jobs.*", &queue).await.unwrap();
+        let mut c2 = bus.subscribe_group("jobs.*", &queue).await.unwrap();
 
         bus.publish("jobs.a", &1u32, None).await.unwrap();
         bus.publish("jobs.b", &2u32, None).await.unwrap();
@@ -492,38 +457,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rabbitmq_bind_queue_idempotent() {
+    async fn test_rabbitmq_subscribe_group_same_pattern_is_allowed() {
         let bus = rabbit_bus!();
         let queue = unique_name("queue");
 
-        bus.bind_queue("jobs.*", &queue).await.unwrap();
-        assert!(bus.bind_queue("jobs.*", &queue).await.is_ok());
+        let _c1 = bus.subscribe_group("jobs.*", &queue).await.unwrap();
+        assert!(bus.subscribe_group("jobs.*", &queue).await.is_ok());
 
         cleanup_queue(&bus, &queue).await;
         cleanup_exchange(&bus).await;
     }
 
     #[tokio::test]
-    async fn test_rabbitmq_bind_queue_conflict_returns_error() {
+    async fn test_rabbitmq_same_group_can_bind_multiple_patterns() {
         let bus = rabbit_bus!();
         let queue = unique_name("queue");
 
-        bus.bind_queue("jobs.*", &queue).await.unwrap();
-        assert!(bus.bind_queue("tasks.*", &queue).await.is_err());
+        let _c1 = bus.subscribe_group("jobs.*", &queue).await.unwrap();
+        assert!(bus.subscribe_group("tasks.*", &queue).await.is_ok());
 
         cleanup_queue(&bus, &queue).await;
-        cleanup_exchange(&bus).await;
-    }
-
-    #[tokio::test]
-    async fn test_rabbitmq_consume_nonexistent_queue_returns_error() {
-        let bus = rabbit_bus!();
-
-        assert!(matches!(
-            bus.consume("ghost").await,
-            Err(BusError::QueueNotFound(_))
-        ));
-
         cleanup_exchange(&bus).await;
     }
 

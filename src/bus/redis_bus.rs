@@ -11,14 +11,13 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
 
 const DEFAULT_CHANNEL: &str = "qanat:bus";
 
 struct RedisState<C: Codec = JsonCodec> {
     local: LocalRouter<C>,
     channel: String,
-    publisher: Mutex<redis::aio::MultiplexedConnection>,
+    publisher: redis::aio::MultiplexedConnection,
 }
 
 pub struct RedisBus<C: Codec = JsonCodec> {
@@ -53,7 +52,7 @@ impl<C: Codec + 'static> RedisBus<C> {
         let inner = Arc::new(RedisState {
             local: LocalRouter::new(codec),
             channel: channel.to_string(),
-            publisher: Mutex::new(publisher),
+            publisher,
         });
 
         Self::start_receive_loop(Arc::clone(&inner), pubsub);
@@ -94,11 +93,11 @@ impl<C: Codec + 'static> RedisBus<C> {
 
     async fn publish_bytes(&self, subject: &str, payload: Bytes) -> Result<(), BusError> {
         let wire = wire::encode(subject, &payload);
-        let mut publisher = self.inner.publisher.lock().await;
+        let mut publisher = self.inner.publisher.clone();
         redis::cmd("PUBLISH")
             .arg(&self.inner.channel)
             .arg(wire)
-            .query_async::<()>(&mut *publisher)
+            .query_async::<()>(&mut publisher)
             .await
             .map_err(|e| BusError::Backend(BackendError::Redis(e)))
     }
@@ -115,15 +114,15 @@ impl<C: Codec> Bus for RedisBus<C> {
     }
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
-        Ok(self.inner.local.subscribe(pattern).await)
+        self.inner.local.subscribe(pattern).await
     }
 
-    async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError> {
-        self.inner.local.bind_queue(pattern, queue).await
-    }
-
-    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
-        self.inner.local.consume(queue).await
+    async fn subscribe_group(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::Subscription, BusError> {
+        self.inner.local.subscribe_group(pattern, group).await
     }
 }
 
@@ -198,9 +197,8 @@ mod tests {
     #[tokio::test]
     async fn test_redis_queue_group_round_robin() {
         let bus = redis_bus!();
-        bus.bind_queue("jobs.*", "workers").await.unwrap();
-        let mut c1 = bus.consume("workers").await.unwrap();
-        let mut c2 = bus.consume("workers").await.unwrap();
+        let mut c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        let mut c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
 
         bus.publish("jobs.a", &1u32, None).await.unwrap();
         bus.publish("jobs.b", &2u32, None).await.unwrap();

@@ -54,10 +54,19 @@ impl SubjectRouter {
         p.len() == s.len()
     }
 
-    /// Register a new fanout subscriber. Each subscriber gets its own binding
-    /// so that dropping one does not affect the others.
+    /// Register a fanout subscriber, grouping subscribers by subject pattern.
     pub fn add_fanout(&mut self, pattern: &str) -> ConsumerId {
         let id = self.alloc_id();
+
+        if let Some(binding) = self
+            .bindings
+            .iter_mut()
+            .find(|binding| binding.queue.is_none() && binding.subject_pattern == pattern)
+        {
+            binding.consumers.push(id);
+            return id;
+        }
+
         self.bindings.push(Binding {
             subject_pattern: pattern.to_string(),
             queue: None,
@@ -134,5 +143,24 @@ impl SubjectRouter {
         }
         self.bindings
             .retain(|b| b.queue.is_some() || !b.consumers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fanout_consumers_with_the_same_pattern_share_a_binding() {
+        let mut router = SubjectRouter::new();
+        let first = router.add_fanout("orders.*");
+        let second = router.add_fanout("orders.*");
+
+        assert_eq!(router.bindings.len(), 1);
+        assert_eq!(router.route("orders.created"), vec![first, second]);
+
+        router.remove_consumer(first);
+
+        assert_eq!(router.route("orders.created"), vec![second]);
     }
 }

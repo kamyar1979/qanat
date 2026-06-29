@@ -1,26 +1,22 @@
 use crate::bus::{Bus, BusStream};
 use crate::errors::BusError;
-use crate::internal_router::InternalRouter;
+use crate::internal_router::RouterHandle;
 use crate::message::{AnyMessage, Envelope};
-use crate::routing::{ConsumerId, SubjectRouter};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::sync::{Mutex, mpsc};
 
 pub struct InternalBus {
-    router: Mutex<SubjectRouter>,
-    senders: Mutex<HashMap<ConsumerId, mpsc::Sender<AnyMessage>>>,
+    router: RouterHandle<AnyMessage>,
     next_msg_id: AtomicU64,
 }
 
 impl InternalBus {
     pub fn new() -> Self {
         Self {
-            router: Mutex::new(SubjectRouter::new()),
-            senders: Mutex::new(HashMap::new()),
+            router: RouterHandle::new(),
             next_msg_id: AtomicU64::new(1),
         }
     }
@@ -47,34 +43,23 @@ impl InternalBus {
     }
 }
 
-impl InternalRouter for InternalBus {
-    type Message = AnyMessage;
-}
-
 impl Bus for InternalBus {
     type Message = AnyMessage;
     type Subscription = BusStream<AnyMessage>;
 
     async fn dispatch(&self, subject: &str, msg: AnyMessage) -> Result<(), BusError> {
-        self.dispatch_internal(&self.router, &self.senders, subject, msg)
-            .await
+        self.router.dispatch(subject, msg).await
     }
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
-        let (tx, rx) = mpsc::channel(128);
-        let id = self.router.lock().await.add_fanout(pattern);
-        self.senders.lock().await.insert(id, tx);
-        Ok(BusStream::new(rx))
+        self.router.subscribe(pattern).await
     }
 
-    async fn bind_queue(&self, pattern: &str, queue: &str) -> Result<(), BusError> {
-        self.router.lock().await.bind_queue(pattern, queue)
-    }
-
-    async fn consume(&self, queue: &str) -> Result<Self::Subscription, BusError> {
-        let (tx, rx) = mpsc::channel(128);
-        let id = self.router.lock().await.add_consumer(queue)?;
-        self.senders.lock().await.insert(id, tx);
-        Ok(BusStream::new(rx))
+    async fn subscribe_group(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::Subscription, BusError> {
+        self.router.subscribe_group(pattern, group).await
     }
 }
