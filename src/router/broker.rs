@@ -1,6 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures::future::LocalBoxFuture;
+
+use crate::bus::Bus;
+use crate::errors::BusError;
+use crate::router::app::InstallableRouter;
+
 pub const DEFAULT_REDELIVERY_MESSAGE_DELAY: Duration = Duration::from_secs(5);
 pub const DEFAULT_MESSAGE_RETRIES: usize = 3;
 
@@ -17,41 +23,118 @@ impl BrokerSubject {
     }
 }
 
-pub struct BrokerRouter<B> {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BrokerRoute {
+    pub pattern: String,
+    pub group: String,
+}
+
+impl BrokerRoute {
+    pub fn new(pattern: impl Into<String>, group: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            group: group.into(),
+        }
+    }
+}
+
+pub trait BrokerRuntime: Send + 'static {
+    fn install<'a>(&'a mut self, route: BrokerRoute) -> LocalBoxFuture<'a, Result<(), BusError>>;
+}
+
+pub struct BusBrokerRuntime<B: Bus> {
     bus: B,
+    subscriptions: Vec<B::Subscription>,
 }
 
-impl<B> BrokerRouter<B> {
+impl<B: Bus> BusBrokerRuntime<B> {
     pub fn new(bus: B) -> Self {
-        Self { bus }
-    }
-
-    pub fn bind(self, pattern: impl Into<String>, queue: impl Into<String>) -> BrokerEndpoint<B> {
-        BrokerEndpoint {
-            router: self,
-            pattern: Some(pattern.into()),
-            queue: queue.into(),
+        Self {
+            bus,
+            subscriptions: Vec::new(),
         }
     }
 
-    pub fn consume(self, queue: impl Into<String>) -> BrokerEndpoint<B> {
-        BrokerEndpoint {
-            router: self,
-            pattern: None,
-            queue: queue.into(),
-        }
-    }
-}
-
-pub struct BrokerEndpoint<B> {
-    pub(crate) router: BrokerRouter<B>,
-    pub pattern: Option<String>,
-    pub queue: String,
-}
-
-impl<B> BrokerEndpoint<B> {
     pub fn bus(&self) -> &B {
-        &self.router.bus
+        &self.bus
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+}
+
+impl<B> BrokerRuntime for BusBrokerRuntime<B>
+where
+    B: Bus + 'static,
+{
+    fn install<'a>(&'a mut self, route: BrokerRoute) -> LocalBoxFuture<'a, Result<(), BusError>> {
+        Box::pin(async move {
+            let subscription = self.bus.subscribe_group(&route.pattern, &route.group).await?;
+            self.subscriptions.push(subscription);
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NoopBrokerRuntime {
+    installed: Vec<BrokerRoute>,
+}
+
+impl NoopBrokerRuntime {
+    pub fn installed_routes(&self) -> &[BrokerRoute] {
+        &self.installed
+    }
+}
+
+impl BrokerRuntime for NoopBrokerRuntime {
+    fn install<'a>(&'a mut self, route: BrokerRoute) -> LocalBoxFuture<'a, Result<(), BusError>> {
+        Box::pin(async move {
+            self.installed.push(route);
+            Ok(())
+        })
+    }
+}
+
+pub struct BrokerRouter<R> {
+    runtime: R,
+    routes: Vec<BrokerRoute>,
+}
+
+impl<R> BrokerRouter<R> {
+    pub fn new(runtime: R) -> Self {
+        Self {
+            runtime,
+            routes: Vec::new(),
+        }
+    }
+
+    pub fn bind(mut self, pattern: impl Into<String>, group: impl Into<String>) -> Self {
+        self.routes.push(BrokerRoute::new(pattern, group));
+        self
+    }
+
+    pub fn runtime(&self) -> &R {
+        &self.runtime
+    }
+
+    pub fn routes(&self) -> &[BrokerRoute] {
+        &self.routes
+    }
+}
+
+impl<R> InstallableRouter for BrokerRouter<R>
+where
+    R: BrokerRuntime,
+{
+    fn install<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), BusError>> {
+        Box::pin(async move {
+            for route in self.routes.clone() {
+                self.runtime.install(route).await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -156,10 +239,22 @@ mod tests {
 
     #[test]
     fn broker_router_builds_broker_source_endpoint() {
-        let endpoint = BrokerRouter::new("bus").bind("orders.created", "orders.in");
+        let router = BrokerRouter::new(NoopBrokerRuntime::default())
+            .bind("orders.created", "orders.in");
 
-        assert_eq!(endpoint.pattern.as_deref(), Some("orders.created"));
-        assert_eq!(endpoint.queue, "orders.in");
-        assert_eq!(endpoint.bus(), &"bus");
+        assert_eq!(router.routes().len(), 1);
+        assert_eq!(router.routes()[0].pattern, "orders.created");
+        assert_eq!(router.routes()[0].group, "orders.in");
+    }
+
+    #[tokio::test]
+    async fn broker_router_installs_routes_into_runtime() {
+        let mut router = BrokerRouter::new(NoopBrokerRuntime::default())
+            .bind("orders.created", "orders.in")
+            .bind("payments.created", "payments.in");
+
+        router.install().await.unwrap();
+
+        assert_eq!(router.runtime().installed_routes().len(), 2);
     }
 }

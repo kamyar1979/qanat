@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::bus::BusStream;
+use crate::bus::routing::{ConsumerId, SubjectRouter};
 use crate::errors::BusError;
-use crate::routing::{ConsumerId, SubjectRouter};
 
 const ROUTER_COMMAND_BUFFER: usize = 1024;
 const SUBSCRIPTION_BUFFER: usize = 128;

@@ -1,29 +1,41 @@
-/// An application component whose concrete type is erased when registered.
-///
-/// Lifecycle methods will be added when the concrete services are implemented.
-pub trait Service: Send {}
+use futures::future::LocalBoxFuture;
+
+use crate::errors::BusError;
+
+/// A router whose concrete family/backend has been selected and can be
+/// installed by the central application composer.
+pub trait InstallableRouter: Send {
+    fn install<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), BusError>>;
+}
 
 pub struct App {
-    services: Vec<Box<dyn Service>>,
+    routers: Vec<Box<dyn InstallableRouter>>,
 }
 
 impl App {
     pub fn new() -> Self {
         Self {
-            services: Vec::new(),
+            routers: Vec::new(),
         }
     }
 
-    pub fn router<S>(mut self, service: S) -> Self
+    pub fn router<R>(mut self, router: R) -> Self
     where
-        S: Service + 'static,
+        R: InstallableRouter + 'static,
     {
-        self.services.push(Box::new(service));
+        self.routers.push(Box::new(router));
         self
     }
 
-    pub fn service_count(&self) -> usize {
-        self.services.len()
+    pub async fn install(&mut self) -> Result<(), BusError> {
+        for router in &mut self.routers {
+            router.install().await?;
+        }
+        Ok(())
+    }
+
+    pub fn router_count(&self) -> usize {
+        self.routers.len()
     }
 }
 
@@ -80,17 +92,35 @@ impl<F, S, T> RouteBinding<F, S, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct HttpService;
-    impl Service for HttpService {}
+    struct FakeRouter {
+        installs: Arc<AtomicUsize>,
+    }
 
-    struct BrokerService;
-    impl Service for BrokerService {}
+    impl InstallableRouter for FakeRouter {
+        fn install<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), BusError>> {
+            Box::pin(async move {
+                self.installs.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        }
+    }
 
-    #[test]
-    fn app_erases_heterogeneous_service_types() {
-        let app = App::new().router(HttpService).router(BrokerService);
+    #[tokio::test]
+    async fn app_erases_and_installs_heterogeneous_router_types() {
+        let installs = Arc::new(AtomicUsize::new(0));
+        let mut app = App::new()
+            .router(FakeRouter {
+                installs: Arc::clone(&installs),
+            })
+            .router(FakeRouter {
+                installs: Arc::clone(&installs),
+            });
 
-        assert_eq!(app.service_count(), 2);
+        assert_eq!(app.router_count(), 2);
+        app.install().await.unwrap();
+        assert_eq!(installs.load(Ordering::Relaxed), 2);
     }
 }

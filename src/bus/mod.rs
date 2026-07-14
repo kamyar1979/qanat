@@ -20,6 +20,7 @@ pub mod rabbitmq_bus;
 pub mod raw_message;
 #[cfg(feature = "redis")]
 pub mod redis_bus;
+pub(crate) mod routing;
 #[cfg(any(feature = "nng", feature = "redis"))]
 pub(crate) mod wire;
 

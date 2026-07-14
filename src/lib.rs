@@ -2,7 +2,6 @@ pub mod bus;
 pub mod errors;
 pub mod http;
 pub mod router;
-pub(crate) mod routing;
 
 pub use bus::codec;
 pub use bus::internal_bus;

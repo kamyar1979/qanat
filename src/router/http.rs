@@ -1,19 +1,62 @@
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
+use futures::future::LocalBoxFuture;
+
+use crate::errors::BusError;
 use crate::http::{HttpEndpoint, HttpRoute};
+use crate::router::app::InstallableRouter;
 
 pub trait HttpHandler: Send + Sync {
     fn route(&self) -> &HttpRoute;
 }
 
-pub struct HttpRouter {
-    handlers: Vec<Box<dyn HttpHandler>>,
+pub trait HttpRuntime: Send + 'static {
+    fn install<'a>(
+        &'a mut self,
+        handler: Arc<dyn HttpHandler>,
+    ) -> LocalBoxFuture<'a, Result<(), BusError>>;
 }
 
-impl HttpRouter {
-    pub fn new() -> Self {
+#[derive(Clone, Debug, Default)]
+pub struct NoopHttpRuntime {
+    installed: usize,
+}
+
+impl NoopHttpRuntime {
+    pub fn installed_count(&self) -> usize {
+        self.installed
+    }
+}
+
+impl HttpRuntime for NoopHttpRuntime {
+    fn install<'a>(
+        &'a mut self,
+        _handler: Arc<dyn HttpHandler>,
+    ) -> LocalBoxFuture<'a, Result<(), BusError>> {
+        Box::pin(async move {
+            self.installed += 1;
+            Ok(())
+        })
+    }
+}
+
+pub struct HttpRouter<R = NoopHttpRuntime> {
+    runtime: R,
+    handlers: Vec<Arc<dyn HttpHandler>>,
+}
+
+impl HttpRouter<NoopHttpRuntime> {
+    pub fn noop() -> Self {
+        Self::new(NoopHttpRuntime::default())
+    }
+}
+
+impl<R> HttpRouter<R> {
+    pub fn new(runtime: R) -> Self {
         Self {
+            runtime,
             handlers: Vec::new(),
         }
     }
@@ -49,7 +92,7 @@ impl HttpRouter {
         F: Fn(I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = O> + Send + 'static,
     {
-        self.handlers.push(Box::new(TypedHttpHandler {
+        self.handlers.push(Arc::new(TypedHttpHandler {
             route,
             handler,
             _types: PhantomData,
@@ -58,17 +101,35 @@ impl HttpRouter {
     }
 
     pub fn handlers(&self) -> impl ExactSizeIterator<Item = &dyn HttpHandler> {
-        self.handlers.iter().map(Box::as_ref)
+        self.handlers.iter().map(Arc::as_ref)
     }
 
     pub fn routes(&self) -> impl ExactSizeIterator<Item = &HttpRoute> {
         self.handlers().map(HttpHandler::route)
     }
+
+    pub fn runtime(&self) -> &R {
+        &self.runtime
+    }
 }
 
-impl Default for HttpRouter {
+impl Default for HttpRouter<NoopHttpRuntime> {
     fn default() -> Self {
-        Self::new()
+        Self::noop()
+    }
+}
+
+impl<R> InstallableRouter for HttpRouter<R>
+where
+    R: HttpRuntime,
+{
+    fn install<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), BusError>> {
+        Box::pin(async move {
+            for handler in &self.handlers {
+                self.runtime.install(Arc::clone(handler)).await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -116,7 +177,7 @@ mod tests {
 
     #[test]
     fn http_router_binds_normal_async_functions() {
-        let router = HttpRouter::new()
+        let router = HttpRouter::noop()
             .bind(HttpRoute::post("/orders"), process_order)
             .bind(HttpRoute::get("/health"), health);
         let routes: Vec<_> = router.routes().collect();
@@ -128,7 +189,7 @@ mod tests {
 
     #[test]
     fn http_router_exposes_endpoint_constructors() {
-        let endpoint = HttpRouter::post("/orders");
+        let endpoint = HttpRouter::<NoopHttpRuntime>::post("/orders");
 
         assert_eq!(endpoint.method, HttpMethod::Post);
         assert_eq!(endpoint.path, "/orders");
@@ -136,10 +197,21 @@ mod tests {
 
     #[test]
     fn http_router_stores_route_and_handler_together() {
-        let router = HttpRouter::new().bind(HttpRoute::post("/orders"), process_order);
+        let router = HttpRouter::noop().bind(HttpRoute::post("/orders"), process_order);
         let handlers: Vec<_> = router.handlers().collect();
 
         assert_eq!(handlers.len(), 1);
         assert_eq!(handlers[0].route().path, "/orders");
+    }
+
+    #[tokio::test]
+    async fn http_router_installs_handlers_into_runtime() {
+        let mut router = HttpRouter::noop()
+            .bind(HttpRoute::post("/orders"), process_order)
+            .bind(HttpRoute::get("/health"), health);
+
+        router.install().await.unwrap();
+
+        assert_eq!(router.runtime().installed_count(), 2);
     }
 }
