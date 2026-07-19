@@ -1,11 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use futures::future::LocalBoxFuture;
-
 use crate::bus::Bus;
 use crate::errors::BusError;
-use crate::router::app::InstallableRouter;
 
 pub const DEFAULT_REDELIVERY_MESSAGE_DELAY: Duration = Duration::from_secs(5);
 pub const DEFAULT_MESSAGE_RETRIES: usize = 3;
@@ -38,75 +35,18 @@ impl BrokerRoute {
     }
 }
 
-pub trait BrokerRuntime: Send + 'static {
-    fn install<'a>(&'a mut self, route: BrokerRoute) -> LocalBoxFuture<'a, Result<(), BusError>>;
-}
-
-pub struct BusBrokerRuntime<B: Bus> {
+pub struct BrokerRouter<B: Bus> {
     bus: B,
+    routes: Vec<BrokerRoute>,
     subscriptions: Vec<B::Subscription>,
 }
 
-impl<B: Bus> BusBrokerRuntime<B> {
+impl<B: Bus> BrokerRouter<B> {
     pub fn new(bus: B) -> Self {
         Self {
             bus,
-            subscriptions: Vec::new(),
-        }
-    }
-
-    pub fn bus(&self) -> &B {
-        &self.bus
-    }
-
-    pub fn subscription_count(&self) -> usize {
-        self.subscriptions.len()
-    }
-}
-
-impl<B> BrokerRuntime for BusBrokerRuntime<B>
-where
-    B: Bus + 'static,
-{
-    fn install<'a>(&'a mut self, route: BrokerRoute) -> LocalBoxFuture<'a, Result<(), BusError>> {
-        Box::pin(async move {
-            let subscription = self.bus.subscribe_group(&route.pattern, &route.group).await?;
-            self.subscriptions.push(subscription);
-            Ok(())
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct NoopBrokerRuntime {
-    installed: Vec<BrokerRoute>,
-}
-
-impl NoopBrokerRuntime {
-    pub fn installed_routes(&self) -> &[BrokerRoute] {
-        &self.installed
-    }
-}
-
-impl BrokerRuntime for NoopBrokerRuntime {
-    fn install<'a>(&'a mut self, route: BrokerRoute) -> LocalBoxFuture<'a, Result<(), BusError>> {
-        Box::pin(async move {
-            self.installed.push(route);
-            Ok(())
-        })
-    }
-}
-
-pub struct BrokerRouter<R> {
-    runtime: R,
-    routes: Vec<BrokerRoute>,
-}
-
-impl<R> BrokerRouter<R> {
-    pub fn new(runtime: R) -> Self {
-        Self {
-            runtime,
             routes: Vec::new(),
+            subscriptions: Vec::new(),
         }
     }
 
@@ -115,26 +55,27 @@ impl<R> BrokerRouter<R> {
         self
     }
 
-    pub fn runtime(&self) -> &R {
-        &self.runtime
+    pub fn bus(&self) -> &B {
+        &self.bus
     }
 
     pub fn routes(&self) -> &[BrokerRoute] {
         &self.routes
     }
-}
 
-impl<R> InstallableRouter for BrokerRouter<R>
-where
-    R: BrokerRuntime,
-{
-    fn install<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), BusError>> {
-        Box::pin(async move {
-            for route in self.routes.clone() {
-                self.runtime.install(route).await?;
-            }
-            Ok(())
-        })
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    pub async fn install(&mut self) -> Result<(), BusError> {
+        for route in self.routes.iter().cloned() {
+            let subscription = self
+                .bus
+                .subscribe_group(&route.pattern, &route.group)
+                .await?;
+            self.subscriptions.push(subscription);
+        }
+        Ok(())
     }
 }
 
@@ -202,6 +143,49 @@ impl BrokerConfiguration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::Bus;
+    use futures::stream;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct FakeBus {
+        group_subscriptions: Arc<AtomicUsize>,
+    }
+
+    impl FakeBus {
+        fn new() -> Self {
+            Self {
+                group_subscriptions: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn group_subscription_count(&self) -> usize {
+            self.group_subscriptions.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Bus for FakeBus {
+        type Message = ();
+        type Subscription = stream::Empty<()>;
+
+        async fn dispatch(&self, _subject: &str, _msg: ()) -> Result<(), BusError> {
+            Ok(())
+        }
+
+        async fn subscribe(&self, _pattern: &str) -> Result<Self::Subscription, BusError> {
+            Ok(stream::empty())
+        }
+
+        async fn subscribe_group(
+            &self,
+            _pattern: &str,
+            _group: &str,
+        ) -> Result<Self::Subscription, BusError> {
+            self.group_subscriptions.fetch_add(1, Ordering::Relaxed);
+            Ok(stream::empty())
+        }
+    }
 
     #[test]
     fn broker_configuration_uses_python_equivalent_defaults() {
@@ -239,22 +223,25 @@ mod tests {
 
     #[test]
     fn broker_router_builds_broker_source_endpoint() {
-        let router = BrokerRouter::new(NoopBrokerRuntime::default())
-            .bind("orders.created", "orders.in");
+        let bus = FakeBus::new();
+        let router = BrokerRouter::new(bus.clone()).bind("orders.created", "orders.in");
 
         assert_eq!(router.routes().len(), 1);
         assert_eq!(router.routes()[0].pattern, "orders.created");
         assert_eq!(router.routes()[0].group, "orders.in");
+        assert_eq!(router.bus().group_subscription_count(), 0);
     }
 
     #[tokio::test]
-    async fn broker_router_installs_routes_into_runtime() {
-        let mut router = BrokerRouter::new(NoopBrokerRuntime::default())
+    async fn broker_router_installs_routes_into_bus() {
+        let bus = FakeBus::new();
+        let mut router = BrokerRouter::new(bus.clone())
             .bind("orders.created", "orders.in")
             .bind("payments.created", "payments.in");
 
         router.install().await.unwrap();
 
-        assert_eq!(router.runtime().installed_routes().len(), 2);
+        assert_eq!(router.subscription_count(), 2);
+        assert_eq!(bus.group_subscription_count(), 2);
     }
 }

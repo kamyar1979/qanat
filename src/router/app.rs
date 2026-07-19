@@ -1,47 +1,116 @@
-use futures::future::LocalBoxFuture;
-
+use crate::bus::Bus;
 use crate::errors::BusError;
-
-/// A router whose concrete family/backend has been selected and can be
-/// installed by the central application composer.
-pub trait InstallableRouter: Send {
-    fn install<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), BusError>>;
-}
+use crate::router::broker::BrokerRouter;
+#[cfg(feature = "axum")]
+use crate::router::http::HttpRouter;
 
 pub struct App {
-    routers: Vec<Box<dyn InstallableRouter>>,
+    #[cfg(feature = "axum")]
+    http: Option<HttpRouter>,
 }
 
 impl App {
     pub fn new() -> Self {
         Self {
-            routers: Vec::new(),
+            #[cfg(feature = "axum")]
+            http: None,
         }
     }
 
-    pub fn router<R>(mut self, router: R) -> Self
+    pub fn broker<B>(self, broker: BrokerRouter<B>) -> BrokerApp<B>
     where
-        R: InstallableRouter + 'static,
+        B: Bus,
     {
-        self.routers.push(Box::new(router));
+        BrokerApp {
+            broker,
+            #[cfg(feature = "axum")]
+            http: self.http,
+        }
+    }
+
+    #[cfg(feature = "axum")]
+    pub fn http(mut self, http: HttpRouter) -> Self {
+        self.http = Some(http);
         self
     }
 
-    pub async fn install(&mut self) -> Result<(), BusError> {
-        for router in &mut self.routers {
-            router.install().await?;
-        }
-        Ok(())
+    #[cfg(feature = "axum")]
+    pub fn http_router(&self) -> Option<&HttpRouter> {
+        self.http.as_ref()
+    }
+
+    #[cfg(feature = "axum")]
+    pub fn into_http_router(self) -> Option<HttpRouter> {
+        self.http
     }
 
     pub fn router_count(&self) -> usize {
-        self.routers.len()
+        #[cfg(feature = "axum")]
+        {
+            usize::from(self.http.is_some())
+        }
+
+        #[cfg(not(feature = "axum"))]
+        {
+            0
+        }
     }
 }
 
 impl Default for App {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub struct BrokerApp<B: Bus> {
+    broker: BrokerRouter<B>,
+    #[cfg(feature = "axum")]
+    http: Option<HttpRouter>,
+}
+
+impl<B> BrokerApp<B>
+where
+    B: Bus,
+{
+    pub fn broker_router(&self) -> &BrokerRouter<B> {
+        &self.broker
+    }
+
+    pub fn broker_router_mut(&mut self) -> &mut BrokerRouter<B> {
+        &mut self.broker
+    }
+
+    pub async fn install(&mut self) -> Result<(), BusError> {
+        self.broker.install().await
+    }
+
+    #[cfg(feature = "axum")]
+    pub fn http(mut self, http: HttpRouter) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    #[cfg(feature = "axum")]
+    pub fn http_router(&self) -> Option<&HttpRouter> {
+        self.http.as_ref()
+    }
+
+    #[cfg(feature = "axum")]
+    pub fn into_http_router(self) -> Option<HttpRouter> {
+        self.http
+    }
+
+    pub fn router_count(&self) -> usize {
+        #[cfg(feature = "axum")]
+        {
+            1 + usize::from(self.http.is_some())
+        }
+
+        #[cfg(not(feature = "axum"))]
+        {
+            1
+        }
     }
 }
 
@@ -92,35 +161,66 @@ impl<F, S, T> RouteBinding<F, S, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct FakeRouter {
-        installs: Arc<AtomicUsize>,
+    #[derive(Clone)]
+    struct FakeBus {
+        group_subscriptions: Arc<AtomicUsize>,
     }
 
-    impl InstallableRouter for FakeRouter {
-        fn install<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), BusError>> {
-            Box::pin(async move {
-                self.installs.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
+    impl FakeBus {
+        fn new() -> Self {
+            Self {
+                group_subscriptions: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn group_subscription_count(&self) -> usize {
+            self.group_subscriptions.load(Ordering::Relaxed)
         }
     }
 
-    #[tokio::test]
-    async fn app_erases_and_installs_heterogeneous_router_types() {
-        let installs = Arc::new(AtomicUsize::new(0));
-        let mut app = App::new()
-            .router(FakeRouter {
-                installs: Arc::clone(&installs),
-            })
-            .router(FakeRouter {
-                installs: Arc::clone(&installs),
-            });
+    impl Bus for FakeBus {
+        type Message = ();
+        type Subscription = stream::Empty<()>;
 
-        assert_eq!(app.router_count(), 2);
+        async fn dispatch(&self, _subject: &str, _msg: ()) -> Result<(), BusError> {
+            Ok(())
+        }
+
+        async fn subscribe(&self, _pattern: &str) -> Result<Self::Subscription, BusError> {
+            Ok(stream::empty())
+        }
+
+        async fn subscribe_group(
+            &self,
+            _pattern: &str,
+            _group: &str,
+        ) -> Result<Self::Subscription, BusError> {
+            self.group_subscriptions.fetch_add(1, Ordering::Relaxed);
+            Ok(stream::empty())
+        }
+    }
+
+    #[test]
+    fn app_starts_without_routers() {
+        let app = App::new();
+
+        assert_eq!(app.router_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn app_installs_broker_router() {
+        let bus = FakeBus::new();
+        let broker = BrokerRouter::new(bus.clone()).bind("orders.created", "orders.in");
+        let mut app = App::new().broker(broker);
+
+        assert_eq!(app.router_count(), 1);
         app.install().await.unwrap();
-        assert_eq!(installs.load(Ordering::Relaxed), 2);
+
+        assert_eq!(app.broker_router().subscription_count(), 1);
+        assert_eq!(bus.group_subscription_count(), 1);
     }
 }

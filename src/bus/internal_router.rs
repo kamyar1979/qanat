@@ -122,7 +122,7 @@ async fn router_actor<M: Clone + Send + 'static>(mut commands: mpsc::Receiver<Ro
                             Ok(BusStream::new(rx))
                         }
                         Err(err) => Err(err),
-                    }
+                    },
                     Err(err) => Err(err),
                 };
                 let _ = reply.send(result);
