@@ -132,9 +132,15 @@ impl<C: Codec + 'static> Bus for RabbitMqBus<C> {
     type Subscription = RabbitMqStream;
 
     /// Publish raw bytes to RabbitMQ. The exchange routes from there.
-    async fn dispatch(&self, subject: &str, msg: RawMessage) -> Result<(), BusError> {
-        self.publish_bytes(subject, msg.payload, msg.envelope.headers)
-            .await
+    fn dispatch<'a>(
+        &'a self,
+        subject: &'a str,
+        msg: RawMessage,
+    ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
+        async move {
+            self.publish_bytes(subject, msg.payload, msg.envelope.headers)
+                .await
+        }
     }
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
@@ -310,6 +316,15 @@ mod tests {
             kind,
             NAME_COUNTER.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    #[test]
+    fn rabbitmq_properties_round_trip_headers() {
+        let headers = HashMap::from([("correlation_id".to_string(), "request-1".to_string())]);
+
+        let properties = headers_to_properties(Some(headers.clone()));
+
+        assert_eq!(properties_to_headers(&properties), Some(headers));
     }
 
     async fn try_bus() -> Option<RabbitMqBus<JsonCodec>> {

@@ -63,18 +63,20 @@ impl<C: Codec + 'static> NngBus<C> {
 
     fn start_receive_loop(inner: Arc<NngState<C>>) {
         // Bridge: blocking NNG recv (OS thread) → tokio channel → async local dispatch
-        let (bridge_tx, mut bridge_rx) = mpsc::channel::<(String, Bytes)>(256);
+        let (bridge_tx, mut bridge_rx) =
+            mpsc::channel::<(String, Option<HashMap<String, String>>, Bytes)>(256);
 
         let inner_recv = Arc::clone(&inner);
         std::thread::spawn(move || {
             loop {
                 match inner_recv.socket.recv() {
                     Ok(msg) => {
-                        if let Some((subject, payload)) = wire::decode(&msg) {
+                        if let Some(frame) = wire::decode(&msg) {
                             if bridge_tx
                                 .blocking_send((
-                                    subject.to_string(),
-                                    Bytes::copy_from_slice(payload),
+                                    frame.subject.to_string(),
+                                    frame.headers,
+                                    Bytes::copy_from_slice(frame.payload),
                                 ))
                                 .is_err()
                             {
@@ -88,13 +90,13 @@ impl<C: Codec + 'static> NngBus<C> {
         });
 
         tokio::spawn(async move {
-            while let Some((subject, payload)) = bridge_rx.recv().await {
+            while let Some((subject, headers, payload)) = bridge_rx.recv().await {
                 let msg = RawMessage {
                     envelope: Envelope {
                         id: inner.local.next_message_id(),
                         subject: subject.clone(),
                         timestamp: Instant::now(),
-                        headers: None,
+                        headers,
                         attempts: 0,
                     },
                     payload,
@@ -113,12 +115,8 @@ impl<C: Codec + 'static> NngBus<C> {
         headers: Option<HashMap<String, String>>,
     ) -> Result<(), BusError> {
         let payload_bytes = self.inner.local.codec.encode(payload)?;
-
-        let wire = wire::encode(subject, &payload_bytes);
-        self.inner
-            .socket
-            .send(nng::Message::from(wire.as_slice()))
-            .map_err(|(_, e)| BusError::Connection(e.to_string()))?;
+        self.publish_bytes(subject, payload_bytes.clone(), headers.clone())
+            .await?;
 
         let raw_msg = RawMessage {
             envelope: Envelope {
@@ -134,15 +132,37 @@ impl<C: Codec + 'static> NngBus<C> {
 
         Ok(())
     }
+
+    async fn publish_bytes(
+        &self,
+        subject: &str,
+        payload: Bytes,
+        headers: Option<HashMap<String, String>>,
+    ) -> Result<(), BusError> {
+        let wire = wire::encode(subject, headers.as_ref(), &payload);
+        self.inner
+            .socket
+            .send(nng::Message::from(wire.as_slice()))
+            .map_err(|(_, e)| BusError::Connection(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl<C: Codec> Bus for NngBus<C> {
     type Message = RawMessage;
     type Subscription = BusStream<RawMessage>;
 
-    /// Route `msg` to local subscribers only. For network delivery use `publish`.
-    async fn dispatch(&self, _subject: &str, msg: RawMessage) -> Result<(), BusError> {
-        self.inner.local.dispatch_local(msg).await
+    /// Publish raw bytes through NNG and route locally because Bus0 does not echo.
+    fn dispatch<'a>(
+        &'a self,
+        subject: &'a str,
+        msg: RawMessage,
+    ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
+        async move {
+            self.publish_bytes(subject, msg.payload.clone(), msg.envelope.headers.clone())
+                .await?;
+            self.inner.local.dispatch_local(msg).await
+        }
     }
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {

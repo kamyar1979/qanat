@@ -47,8 +47,12 @@ impl Bus for InternalBus {
     type Message = AnyMessage;
     type Subscription = BusStream<AnyMessage>;
 
-    async fn dispatch(&self, subject: &str, msg: AnyMessage) -> Result<(), BusError> {
-        self.router.dispatch(subject, msg).await
+    fn dispatch<'a>(
+        &'a self,
+        subject: &'a str,
+        msg: AnyMessage,
+    ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
+        async move { self.router.dispatch(subject, msg).await }
     }
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {

@@ -199,6 +199,7 @@ mod tests {
         use super::*;
         use crate::codec::JsonCodec;
         use crate::nng_bus::NngBus;
+        use std::collections::HashMap;
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NNG_URL_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -245,6 +246,44 @@ mod tests {
                 .await
                 .expect("timed out")
                 .expect("stream ended");
+            assert_eq!(msg.decode_json::<String>().unwrap(), "order-1");
+        }
+
+        #[tokio::test]
+        async fn test_nng_preserves_headers_across_nodes() {
+            let url = nng_url();
+            let listener = NngBus::listen(JsonCodec, &url).unwrap();
+            let dialer = NngBus::dial(JsonCodec, &url).unwrap();
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let mut sub = listener.subscribe("orders.>").await.unwrap();
+
+            dialer
+                .publish(
+                    "orders.placed",
+                    &"order-1",
+                    Some(HashMap::from([(
+                        "correlation_id".to_string(),
+                        "request-1".to_string(),
+                    )])),
+                )
+                .await
+                .unwrap();
+
+            let msg = timeout(Duration::from_millis(200), sub.next())
+                .await
+                .expect("timed out")
+                .expect("stream ended");
+
+            assert_eq!(
+                msg.envelope
+                    .headers
+                    .as_ref()
+                    .and_then(|headers| headers.get("correlation_id"))
+                    .map(String::as_str),
+                Some("request-1")
+            );
             assert_eq!(msg.decode_json::<String>().unwrap(), "order-1");
         }
 

@@ -20,6 +20,9 @@ pub enum BusError {
 
     /// Connection or network failure
     Connection(String),
+
+    /// An operation did not complete before its deadline.
+    Timeout(String),
 }
 
 #[derive(Debug)]
@@ -80,6 +83,7 @@ impl fmt::Display for BusError {
             BusError::Backend(err) => write!(f, "Backend error: {}", err),
             BusError::Serialization(msg) => write!(f, "Serialization error: {}", msg),
             BusError::Connection(msg) => write!(f, "Connection error: {}", msg),
+            BusError::Timeout(msg) => write!(f, "Timeout: {}", msg),
         }
     }
 }

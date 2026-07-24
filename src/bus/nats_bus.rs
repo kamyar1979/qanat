@@ -45,20 +45,7 @@ impl<C: Codec> NatsBus<C> {
         let payload_bytes = self.codec.encode(payload)?;
 
         if let Some(hdrs) = headers {
-            let mut header_map = async_nats::header::HeaderMap::new();
-            for (k, v) in hdrs {
-                let name: async_nats::header::HeaderName =
-                    k.parse()
-                        .map_err(|e: async_nats::header::ParseHeaderNameError| {
-                            BusError::Internal(e.to_string())
-                        })?;
-                let value: async_nats::header::HeaderValue =
-                    v.parse()
-                        .map_err(|e: async_nats::header::ParseHeaderValueError| {
-                            BusError::Internal(e.to_string())
-                        })?;
-                header_map.insert(name, value);
-            }
+            let header_map = headers_to_nats(hdrs)?;
             self.client
                 .publish_with_headers(subject.to_string(), header_map, payload_bytes)
                 .await
@@ -72,6 +59,26 @@ impl<C: Codec> NatsBus<C> {
 
         Ok(())
     }
+}
+
+fn headers_to_nats(
+    headers: HashMap<String, String>,
+) -> Result<async_nats::header::HeaderMap, BusError> {
+    let mut header_map = async_nats::header::HeaderMap::new();
+    for (k, v) in headers {
+        let name: async_nats::header::HeaderName =
+            k.parse()
+                .map_err(|e: async_nats::header::ParseHeaderNameError| {
+                    BusError::Internal(e.to_string())
+                })?;
+        let value: async_nats::header::HeaderValue =
+            v.parse()
+                .map_err(|e: async_nats::header::ParseHeaderValueError| {
+                    BusError::Internal(e.to_string())
+                })?;
+        header_map.insert(name, value);
+    }
+    Ok(header_map)
 }
 
 fn nats_msg_to_raw(msg: async_nats::Message, id: u64) -> RawMessage {
@@ -128,12 +135,26 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
     type Subscription = NatsStream;
 
     /// Forward the raw bytes directly into NATS — the server routes from there.
-    async fn dispatch(&self, subject: &str, msg: RawMessage) -> Result<(), BusError> {
-        self.client
-            .publish(subject.to_string(), msg.payload)
-            .await
-            .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
-        Ok(())
+    fn dispatch<'a>(
+        &'a self,
+        subject: &'a str,
+        msg: RawMessage,
+    ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
+        async move {
+            if let Some(hdrs) = msg.envelope.headers {
+                let header_map = headers_to_nats(hdrs)?;
+                self.client
+                    .publish_with_headers(subject.to_string(), header_map, msg.payload)
+                    .await
+                    .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
+            } else {
+                self.client
+                    .publish(subject.to_string(), msg.payload)
+                    .await
+                    .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
+            }
+            Ok(())
+        }
     }
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {

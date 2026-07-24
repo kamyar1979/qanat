@@ -1,5 +1,6 @@
 use crate::errors::BusError;
 use futures::Stream;
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
@@ -59,7 +60,11 @@ pub trait Bus: Send + Sync {
     type Subscription: Stream<Item = Self::Message> + Send + Unpin + 'static;
 
     /// Route and deliver an already-constructed message to local subscribers.
-    async fn dispatch(&self, subject: &str, msg: Self::Message) -> Result<(), BusError>;
+    fn dispatch<'a>(
+        &'a self,
+        subject: &'a str,
+        msg: Self::Message,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + 'a;
 
     async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError>;
     async fn subscribe_group(

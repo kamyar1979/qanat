@@ -1,19 +1,32 @@
 use axum::handler::Handler;
 use axum::routing::{MethodRouter, delete, get, patch, post, put};
 
-pub struct HttpRouter {
+use crate::codec::{Codec, JsonCodec};
+
+pub struct HttpRouter<C: Codec = JsonCodec> {
     router: axum::Router,
+    codec: C,
 }
 
-impl HttpRouter {
+impl HttpRouter<JsonCodec> {
     pub fn new() -> Self {
+        Self::with_codec(JsonCodec)
+    }
+}
+
+impl<C> HttpRouter<C>
+where
+    C: Codec,
+{
+    pub fn with_codec(codec: C) -> Self {
         Self {
             router: axum::Router::new(),
+            codec,
         }
     }
 
-    pub fn from_router(router: axum::Router) -> Self {
-        Self { router }
+    pub fn from_router(router: axum::Router, codec: C) -> Self {
+        Self { router, codec }
     }
 
     pub fn route(mut self, path: &str, method_router: MethodRouter) -> Self {
@@ -75,12 +88,16 @@ impl HttpRouter {
         &self.router
     }
 
+    pub fn codec(&self) -> &C {
+        &self.codec
+    }
+
     pub fn into_router(self) -> axum::Router {
         self.router
     }
 }
 
-impl Default for HttpRouter {
+impl Default for HttpRouter<JsonCodec> {
     fn default() -> Self {
         Self::new()
     }
@@ -138,5 +155,12 @@ mod tests {
             .into_router();
 
         let _: axum::Router = router;
+    }
+
+    #[test]
+    fn http_router_accepts_explicit_codec() {
+        let router = HttpRouter::with_codec(crate::codec::JsonCodec).get("/health", health);
+
+        let _: &crate::codec::JsonCodec = router.codec();
     }
 }
