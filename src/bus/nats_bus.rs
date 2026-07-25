@@ -6,9 +6,8 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use futures::Stream;
-use serde::Serialize;
 
-use crate::bus::Bus;
+use crate::bus::RawBus;
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::{BackendError, BusError};
 use crate::message::Envelope;
@@ -34,30 +33,6 @@ impl<C: Codec> NatsBus<C> {
             codec,
             next_msg_id: Arc::new(AtomicU64::new(1)),
         })
-    }
-
-    pub async fn publish<T: Serialize>(
-        &self,
-        subject: &str,
-        payload: &T,
-        headers: Option<HashMap<String, String>>,
-    ) -> Result<(), BusError> {
-        let payload_bytes = self.codec.encode(payload)?;
-
-        if let Some(hdrs) = headers {
-            let header_map = headers_to_nats(hdrs)?;
-            self.client
-                .publish_with_headers(subject.to_string(), header_map, payload_bytes)
-                .await
-                .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
-        } else {
-            self.client
-                .publish(subject.to_string(), payload_bytes)
-                .await
-                .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
-        }
-
-        Ok(())
     }
 }
 
@@ -130,26 +105,30 @@ impl Stream for NatsStream {
     }
 }
 
-impl<C: Codec + 'static> Bus for NatsBus<C> {
-    type Message = RawMessage;
-    type Subscription = NatsStream;
+impl<C: Codec + 'static> RawBus for NatsBus<C> {
+    type Codec = C;
+    type RawSubscription = NatsStream;
 
-    /// Forward the raw bytes directly into NATS — the server routes from there.
-    fn dispatch<'a>(
+    fn codec(&self) -> &Self::Codec {
+        &self.codec
+    }
+
+    fn publish_bytes<'a>(
         &'a self,
         subject: &'a str,
-        msg: RawMessage,
+        payload: bytes::Bytes,
+        headers: Option<HashMap<String, String>>,
     ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
         async move {
-            if let Some(hdrs) = msg.envelope.headers {
-                let header_map = headers_to_nats(hdrs)?;
+            if let Some(my_headers) = headers {
+                let header_map = headers_to_nats(my_headers)?;
                 self.client
-                    .publish_with_headers(subject.to_string(), header_map, msg.payload)
+                    .publish_with_headers(subject.to_string(), header_map, payload)
                     .await
                     .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
             } else {
                 self.client
-                    .publish(subject.to_string(), msg.payload)
+                    .publish(subject.to_string(), payload)
                     .await
                     .map_err(|e| BusError::Backend(BackendError::NatsPublish(e)))?;
             }
@@ -157,7 +136,7 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
         }
     }
 
-    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError> {
         let sub = self
             .client
             .subscribe(pattern.to_string())
@@ -166,11 +145,11 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
         Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 
-    async fn subscribe_group(
+    async fn subscribe_group_raw(
         &self,
         pattern: &str,
         group: &str,
-    ) -> Result<Self::Subscription, BusError> {
+    ) -> Result<Self::RawSubscription, BusError> {
         let sub = self
             .client
             .queue_subscribe(pattern.to_string(), group.to_string())
@@ -185,6 +164,7 @@ impl<C: Codec + 'static> Bus for NatsBus<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::Bus;
     use crate::codec::JsonCodec;
     use futures::StreamExt;
     use std::time::Duration;

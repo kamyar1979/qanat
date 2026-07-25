@@ -1,5 +1,10 @@
+use crate::codec::Codec;
 use crate::errors::BusError;
+use crate::raw_message::RawMessage;
+use bytes::Bytes;
 use futures::Stream;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -72,4 +77,80 @@ pub trait Bus: Send + Sync {
         pattern: &str,
         group: &str,
     ) -> Result<Self::Subscription, BusError>;
+}
+
+/// Implementation capability for byte-oriented external bus backends.
+///
+/// Implementors provide transport-specific byte publishing and subscriptions.
+/// The blanket [`Bus`] implementation supplies `RawMessage` dispatch.
+#[allow(async_fn_in_trait)]
+pub trait RawBus: Send + Sync {
+    type Codec: crate::codec::Codec;
+    type RawSubscription: Stream<Item = RawMessage> + Send + Unpin + 'static;
+
+    fn codec(&self) -> &Self::Codec;
+
+    fn publish<'a, T: Serialize>(
+        &'a self,
+        subject: &'a str,
+        value: &T,
+        headers: Option<HashMap<String, String>>,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + 'a {
+        let payload = self.codec().encode(value);
+
+        async move { self.publish_bytes(subject, payload?, headers).await }
+    }
+
+    fn publish_bytes<'a>(
+        &'a self,
+        subject: &'a str,
+        payload: Bytes,
+        headers: Option<HashMap<String, String>>,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + 'a;
+
+    fn dispatch_raw<'a>(
+        &'a self,
+        subject: &'a str,
+        message: RawMessage,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + 'a {
+        async move {
+            self.publish_bytes(subject, message.payload, message.envelope.headers)
+                .await
+        }
+    }
+
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError>;
+    async fn subscribe_group_raw(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::RawSubscription, BusError>;
+}
+
+impl<T> Bus for T
+where
+    T: RawBus,
+{
+    type Message = RawMessage;
+    type Subscription = T::RawSubscription;
+
+    fn dispatch<'a>(
+        &'a self,
+        subject: &'a str,
+        message: RawMessage,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + 'a {
+        self.dispatch_raw(subject, message)
+    }
+
+    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
+        self.subscribe_raw(pattern).await
+    }
+
+    async fn subscribe_group(
+        &self,
+        pattern: &str,
+        group: &str,
+    ) -> Result<Self::Subscription, BusError> {
+        self.subscribe_group_raw(pattern, group).await
+    }
 }

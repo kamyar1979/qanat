@@ -1,10 +1,7 @@
 use std::collections::HashMap;
-use std::collections::hash_map::RandomState;
 use std::future::Future;
-use std::hash::{BuildHasher, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -17,6 +14,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OnceCell, mpsc, oneshot};
+use uuid::Uuid;
 
 pub const DEFAULT_REDELIVERY_MESSAGE_DELAY: Duration = Duration::from_secs(5);
 pub const DEFAULT_MESSAGE_RETRIES: usize = 3;
@@ -25,10 +23,7 @@ pub const DEFAULT_REPLY_TOPIC_PREFIX: &str = "_qanat.reply";
 pub const CORRELATION_ID_HEADER: &str = "correlation_id";
 pub const REPLY_TO_HEADER: &str = "reply_to";
 
-static NEXT_PROXY_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-static PROCESS_UNIQUE_ID: LazyLock<u64> =
-    LazyLock::new(|| RandomState::new().build_hasher().finish());
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BrokerSubject {
@@ -558,8 +553,7 @@ where
                         "broker proxy requires either reply_to or reply_topic_prefix".into(),
                     )
                 })?;
-                let proxy_id = NEXT_PROXY_ID.fetch_add(1, Ordering::Relaxed);
-                format!("{prefix}.{:016x}.{proxy_id}", *PROCESS_UNIQUE_ID)
+                format!("{prefix}.{}", Uuid::new_v4().simple())
             }
         };
         let mut subscription = self.bus.subscribe(&reply_subject).await?;
@@ -632,7 +626,7 @@ where
         let commands = &runtime.commands;
         let reply_subject = &runtime.reply_subject;
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let correlation_id = format!("{reply_subject}.{request_id}");
+        let correlation_id = Uuid::new_v4().to_string();
         let payload = self.codec.encode(input)?;
 
         headers.insert(CORRELATION_ID_HEADER.to_string(), correlation_id.clone());

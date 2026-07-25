@@ -15,9 +15,8 @@ use lapin::types::{AMQPValue, FieldTable, LongString, ShortString};
 use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind, Queue,
 };
-use serde::Serialize;
 
-use crate::bus::Bus;
+use crate::bus::RawBus;
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::{BackendError, BusError};
 use crate::message::Envelope;
@@ -67,37 +66,6 @@ impl<C: Codec> RabbitMqBus<C> {
         })
     }
 
-    pub async fn publish<T: Serialize>(
-        &self,
-        subject: &str,
-        payload: &T,
-        headers: Option<HashMap<String, String>>,
-    ) -> Result<(), BusError> {
-        let payload_bytes = self.codec.encode(payload)?;
-        self.publish_bytes(subject, payload_bytes, headers).await
-    }
-
-    async fn publish_bytes(
-        &self,
-        subject: &str,
-        payload: Bytes,
-        headers: Option<HashMap<String, String>>,
-    ) -> Result<(), BusError> {
-        self.channel
-            .basic_publish(
-                self.exchange.clone().into(),
-                subject.into(),
-                BasicPublishOptions::default(),
-                &payload,
-                headers_to_properties(headers),
-            )
-            .await
-            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?
-            .await
-            .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
-        Ok(())
-    }
-
     async fn declare_subscription_queue(&self) -> Result<Queue, BusError> {
         self.channel
             .queue_declare(
@@ -127,23 +95,38 @@ impl<C: Codec> RabbitMqBus<C> {
     }
 }
 
-impl<C: Codec + 'static> Bus for RabbitMqBus<C> {
-    type Message = RawMessage;
-    type Subscription = RabbitMqStream;
+impl<C: Codec + 'static> RawBus for RabbitMqBus<C> {
+    type Codec = C;
+    type RawSubscription = RabbitMqStream;
 
-    /// Publish raw bytes to RabbitMQ. The exchange routes from there.
-    fn dispatch<'a>(
+    fn codec(&self) -> &Self::Codec {
+        &self.codec
+    }
+
+    fn publish_bytes<'a>(
         &'a self,
         subject: &'a str,
-        msg: RawMessage,
+        payload: Bytes,
+        headers: Option<HashMap<String, String>>,
     ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
         async move {
-            self.publish_bytes(subject, msg.payload, msg.envelope.headers)
+            self.channel
+                .basic_publish(
+                    self.exchange.clone().into(),
+                    subject.into(),
+                    BasicPublishOptions::default(),
+                    &payload,
+                    headers_to_properties(headers),
+                )
                 .await
+                .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?
+                .await
+                .map_err(|e| BusError::Backend(BackendError::RabbitMq(e)))?;
+            Ok(())
         }
     }
 
-    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError> {
         let queue = self.declare_subscription_queue().await?;
         let binding_key = rabbit_binding_key(pattern)?;
         self.channel
@@ -160,11 +143,11 @@ impl<C: Codec + 'static> Bus for RabbitMqBus<C> {
         self.consume_queue(queue.name().as_str()).await
     }
 
-    async fn subscribe_group(
+    async fn subscribe_group_raw(
         &self,
         pattern: &str,
         group: &str,
-    ) -> Result<Self::Subscription, BusError> {
+    ) -> Result<Self::RawSubscription, BusError> {
         let binding_key = rabbit_binding_key(pattern)?;
 
         self.channel
@@ -300,6 +283,7 @@ impl Stream for RabbitMqStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::Bus;
     use crate::codec::JsonCodec;
     use futures::StreamExt;
     use lapin::options::{ExchangeDeleteOptions, QueueDeleteOptions};

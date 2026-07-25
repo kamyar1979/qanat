@@ -20,11 +20,14 @@ pub use bus::raw_message;
 pub use bus::redis_bus;
 #[cfg(any(feature = "nng", feature = "redis"))]
 pub(crate) use bus::wire;
+pub use bus::{Bus, RawBus};
 
 #[cfg(test)]
 mod tests {
     use super::internal_bus::InternalBus;
     use crate::bus::Bus;
+    #[cfg(feature = "nng")]
+    use crate::bus::RawBus;
     use crate::errors::BusError;
     use futures::StreamExt;
     use std::time::Duration;

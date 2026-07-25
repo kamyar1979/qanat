@@ -51,7 +51,7 @@ impl Bus for InternalBus {
         &'a self,
         subject: &'a str,
         msg: AnyMessage,
-    ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
+    ) -> impl Future<Output = Result<(), BusError>> + Send + 'a {
         async move { self.router.dispatch(subject, msg).await }
     }
 

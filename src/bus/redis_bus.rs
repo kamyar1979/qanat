@@ -1,4 +1,4 @@
-use crate::bus::{Bus, BusStream};
+use crate::bus::{BusStream, RawBus};
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::{BackendError, BusError};
 use crate::local_router::LocalRouter;
@@ -7,7 +7,6 @@ use crate::raw_message::RawMessage;
 use crate::wire;
 use bytes::Bytes;
 use futures::StreamExt;
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -80,60 +79,43 @@ impl<C: Codec + 'static> RedisBus<C> {
             }
         });
     }
-
-    pub async fn publish<T: Serialize>(
-        &self,
-        subject: &str,
-        payload: &T,
-        headers: Option<HashMap<String, String>>,
-    ) -> Result<(), BusError> {
-        let payload_bytes = self.inner.local.codec.encode(payload)?;
-        self.publish_bytes(subject, payload_bytes, headers).await
-    }
-
-    async fn publish_bytes(
-        &self,
-        subject: &str,
-        payload: Bytes,
-        headers: Option<HashMap<String, String>>,
-    ) -> Result<(), BusError> {
-        let wire = wire::encode(subject, headers.as_ref(), &payload);
-        let mut publisher = self.inner.publisher.clone();
-        redis::cmd("PUBLISH")
-            .arg(&self.inner.channel)
-            .arg(wire)
-            .query_async::<()>(&mut publisher)
-            .await
-            .map_err(|e| BusError::Backend(BackendError::Redis(e)))
-    }
 }
 
-impl<C: Codec> Bus for RedisBus<C> {
-    type Message = RawMessage;
-    type Subscription = BusStream<RawMessage>;
+impl<C: Codec> RawBus for RedisBus<C> {
+    type Codec = C;
+    type RawSubscription = BusStream<RawMessage>;
 
-    /// Publish raw bytes through Redis. The Redis subscriber loop receives the
-    /// frame and applies local Qanat routing.
-    fn dispatch<'a>(
+    fn codec(&self) -> &Self::Codec {
+        &self.inner.local.codec
+    }
+
+    fn publish_bytes<'a>(
         &'a self,
         subject: &'a str,
-        msg: RawMessage,
+        payload: Bytes,
+        headers: Option<HashMap<String, String>>,
     ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
         async move {
-            self.publish_bytes(subject, msg.payload, msg.envelope.headers)
+            let wire = wire::encode(subject, headers.as_ref(), &payload);
+            let mut publisher = self.inner.publisher.clone();
+            redis::cmd("PUBLISH")
+                .arg(&self.inner.channel)
+                .arg(wire)
+                .query_async::<()>(&mut publisher)
                 .await
+                .map_err(|e| BusError::Backend(BackendError::Redis(e)))
         }
     }
 
-    async fn subscribe(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError> {
         self.inner.local.subscribe(pattern).await
     }
 
-    async fn subscribe_group(
+    async fn subscribe_group_raw(
         &self,
         pattern: &str,
         group: &str,
-    ) -> Result<Self::Subscription, BusError> {
+    ) -> Result<Self::RawSubscription, BusError> {
         self.inner.local.subscribe_group(pattern, group).await
     }
 }
@@ -141,6 +123,7 @@ impl<C: Codec> Bus for RedisBus<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::Bus;
     use crate::codec::JsonCodec;
     use futures::StreamExt;
     use std::sync::atomic::{AtomicU64, Ordering};
