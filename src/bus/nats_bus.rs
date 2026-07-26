@@ -142,6 +142,10 @@ impl<C: Codec + 'static> ExternalBus for NatsBus<C> {
             .subscribe(pattern.to_string())
             .await
             .map_err(|e| BusError::Backend(BackendError::NatsSubscribe(e)))?;
+        self.client
+            .flush()
+            .await
+            .map_err(|e| BusError::Backend(BackendError::NatsFlush(e)))?;
         Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 
@@ -155,6 +159,10 @@ impl<C: Codec + 'static> ExternalBus for NatsBus<C> {
             .queue_subscribe(pattern.to_string(), group.to_string())
             .await
             .map_err(|e| BusError::Backend(BackendError::NatsSubscribe(e)))?;
+        self.client
+            .flush()
+            .await
+            .map_err(|e| BusError::Backend(BackendError::NatsFlush(e)))?;
         Ok(NatsStream::new(sub, Arc::clone(&self.next_msg_id)))
     }
 }
@@ -238,30 +246,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nats_queue_group_round_robin() {
+    async fn test_nats_queue_group_delivers_each_message_once() {
         let bus = nats_bus!();
-        let mut c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
-        let mut c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        let c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
+        let c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
 
         bus.publish("jobs.a", &1u32, None).await.unwrap();
         bus.publish("jobs.b", &2u32, None).await.unwrap();
 
-        let m1 = timeout(DELIVERY_TIMEOUT, c1.next())
-            .await
-            .expect("timed out")
-            .unwrap()
-            .decode_json::<u32>()
-            .unwrap();
-        let m2 = timeout(DELIVERY_TIMEOUT, c2.next())
-            .await
-            .expect("timed out")
-            .unwrap()
-            .decode_json::<u32>()
-            .unwrap();
-
-        assert!(m1 == 1 || m1 == 2);
-        assert!(m2 == 1 || m2 == 2);
-        assert_ne!(m1, m2);
+        let mut messages = timeout(
+            DELIVERY_TIMEOUT,
+            futures::stream::select(c1, c2)
+                .take(2)
+                .map(|message| message.decode_json::<u32>().unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .expect("timed out");
+        messages.sort_unstable();
+        assert_eq!(messages, vec![1, 2]);
     }
 
     #[tokio::test]

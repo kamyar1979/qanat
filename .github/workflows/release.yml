@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -86,8 +86,20 @@ jobs:
             fi
           done
 
-      - name: Run tests
-        run: cargo test --locked --all-features --no-fail-fast -- --test-threads=1
+      - name: Run core tests
+        run: cargo test --locked --features axum,cbor,msgpack -- --test-threads=1
+
+      - name: Run NATS tests
+        run: cargo test --locked --features nats bus::nats_bus::tests -- --test-threads=1
+
+      - name: Run NNG tests
+        run: cargo test --locked --features nng tests::nng_tests -- --test-threads=1
+
+      - name: Run RabbitMQ tests
+        run: cargo test --locked --features rabbitmq bus::rabbitmq_bus::tests -- --test-threads=1
+
+      - name: Run Redis tests
+        run: cargo test --locked --features redis bus::redis_bus::tests -- --test-threads=1
 
       - name: Verify package
         run: cargo package --locked

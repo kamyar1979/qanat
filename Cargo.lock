@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "qanat-routing"
-version = "0.1.0-beta.2"
+version = "0.1.0-beta.3"
 dependencies = [
  "async-nats",
  "axum",

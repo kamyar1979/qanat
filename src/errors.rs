@@ -35,6 +35,9 @@ pub enum BackendError {
     #[cfg(feature = "nats")]
     NatsSubscribe(async_nats::SubscribeError),
 
+    #[cfg(feature = "nats")]
+    NatsFlush(async_nats::client::FlushError),
+
     #[cfg(feature = "rabbitmq")]
     RabbitMq(lapin::Error),
 
@@ -50,6 +53,8 @@ impl fmt::Display for BackendError {
             BackendError::NatsPublish(err) => write!(f, "NATS publish error: {}", err),
             #[cfg(feature = "nats")]
             BackendError::NatsSubscribe(err) => write!(f, "NATS subscribe error: {}", err),
+            #[cfg(feature = "nats")]
+            BackendError::NatsFlush(err) => write!(f, "NATS flush error: {}", err),
             #[cfg(feature = "rabbitmq")]
             BackendError::RabbitMq(err) => write!(f, "RabbitMQ error: {}", err),
             #[cfg(feature = "redis")]
@@ -66,6 +71,8 @@ impl Error for BackendError {
             BackendError::NatsPublish(err) => Some(err),
             #[cfg(feature = "nats")]
             BackendError::NatsSubscribe(err) => Some(err),
+            #[cfg(feature = "nats")]
+            BackendError::NatsFlush(err) => Some(err),
             #[cfg(feature = "rabbitmq")]
             BackendError::RabbitMq(err) => Some(err),
             #[cfg(feature = "redis")]
