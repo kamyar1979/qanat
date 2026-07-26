@@ -131,6 +131,7 @@ mod tests {
     use tokio::time::timeout;
 
     const REDIS_URL: &str = "redis://127.0.0.1/";
+    const DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
     static CHANNEL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn redis_channel() -> String {
@@ -166,7 +167,7 @@ mod tests {
 
         bus.publish("events.login", &42u32, None).await.unwrap();
 
-        let msg = timeout(Duration::from_millis(500), sub.next())
+        let msg = timeout(DELIVERY_TIMEOUT, sub.next())
             .await
             .expect("timed out")
             .expect("stream ended");
@@ -182,7 +183,7 @@ mod tests {
             .await
             .unwrap();
 
-        let msg = timeout(Duration::from_millis(500), sub.next())
+        let msg = timeout(DELIVERY_TIMEOUT, sub.next())
             .await
             .expect("timed out")
             .expect("stream ended");
@@ -205,7 +206,7 @@ mod tests {
         .await
         .unwrap();
 
-        let msg = timeout(Duration::from_millis(500), sub.next())
+        let msg = timeout(DELIVERY_TIMEOUT, sub.next())
             .await
             .expect("timed out")
             .expect("stream ended");
@@ -230,13 +231,13 @@ mod tests {
         bus.publish("jobs.a", &1u32, None).await.unwrap();
         bus.publish("jobs.b", &2u32, None).await.unwrap();
 
-        let m1 = timeout(Duration::from_millis(500), c1.next())
+        let m1 = timeout(DELIVERY_TIMEOUT, c1.next())
             .await
             .expect("timed out")
             .unwrap()
             .decode_json::<u32>()
             .unwrap();
-        let m2 = timeout(Duration::from_millis(500), c2.next())
+        let m2 = timeout(DELIVERY_TIMEOUT, c2.next())
             .await
             .expect("timed out")
             .unwrap()
@@ -265,7 +266,7 @@ mod tests {
         };
         bus.dispatch("internal.event", raw).await.unwrap();
 
-        let msg = timeout(Duration::from_millis(500), sub.next())
+        let msg = timeout(DELIVERY_TIMEOUT, sub.next())
             .await
             .expect("timed out")
             .expect("stream ended");

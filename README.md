@@ -27,7 +27,7 @@ external broker dependency:
 
 ```toml
 [dependencies]
-qanat-router = "0.1.0-beta.1"
+qanat-router = "0.1.0-beta.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 ```
@@ -36,7 +36,7 @@ Enable only the integrations required by the application:
 
 ```toml
 [dependencies]
-qanat-router = { version = "0.1.0-beta.1", features = ["nats", "axum"] }
+qanat-router = { version = "0.1.0-beta.2", features = ["nats", "axum"] }
 ```
 
 ## In-Memory Bus

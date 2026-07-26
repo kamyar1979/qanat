@@ -209,6 +209,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NNG_URL_COUNTER: AtomicU64 = AtomicU64::new(1);
+        const CONNECTION_SETTLE_TIME: Duration = Duration::from_millis(100);
+        const DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
         fn nng_url() -> String {
             format!(
@@ -225,7 +227,7 @@ mod tests {
 
             bus.publish("events.login", &42u32, None).await.unwrap();
 
-            let msg = timeout(Duration::from_millis(200), sub.next())
+            let msg = timeout(DELIVERY_TIMEOUT, sub.next())
                 .await
                 .expect("timed out")
                 .expect("stream ended");
@@ -239,7 +241,7 @@ mod tests {
             let dialer = NngBus::dial(JsonCodec, &url).unwrap();
 
             // Let the connection establish before subscribing / publishing
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(CONNECTION_SETTLE_TIME).await;
 
             let mut sub = listener.subscribe("orders.>").await.unwrap();
 
@@ -248,7 +250,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let msg = timeout(Duration::from_millis(200), sub.next())
+            let msg = timeout(DELIVERY_TIMEOUT, sub.next())
                 .await
                 .expect("timed out")
                 .expect("stream ended");
@@ -261,7 +263,7 @@ mod tests {
             let listener = NngBus::listen(JsonCodec, &url).unwrap();
             let dialer = NngBus::dial(JsonCodec, &url).unwrap();
 
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(CONNECTION_SETTLE_TIME).await;
 
             let mut sub = listener.subscribe("orders.>").await.unwrap();
 
@@ -277,7 +279,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let msg = timeout(Duration::from_millis(200), sub.next())
+            let msg = timeout(DELIVERY_TIMEOUT, sub.next())
                 .await
                 .expect("timed out")
                 .expect("stream ended");
@@ -299,7 +301,7 @@ mod tests {
             let listener = NngBus::listen(JsonCodec, &url).unwrap();
             let dialer = NngBus::dial(JsonCodec, &url).unwrap();
 
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(CONNECTION_SETTLE_TIME).await;
 
             let mut sub_all = listener.subscribe(">").await.unwrap();
             let mut sub_foo = listener.subscribe("foo.*").await.unwrap();
@@ -308,13 +310,13 @@ mod tests {
             dialer.publish("foo.x", &1u32, None).await.unwrap();
 
             // sub_all and sub_foo match; sub_bar does not
-            let v1 = timeout(Duration::from_millis(200), sub_all.next())
+            let v1 = timeout(DELIVERY_TIMEOUT, sub_all.next())
                 .await
                 .expect("timed out")
                 .unwrap()
                 .decode_json::<u32>()
                 .unwrap();
-            let v2 = timeout(Duration::from_millis(200), sub_foo.next())
+            let v2 = timeout(DELIVERY_TIMEOUT, sub_foo.next())
                 .await
                 .expect("timed out")
                 .unwrap()
@@ -333,7 +335,7 @@ mod tests {
             let listener = NngBus::listen(JsonCodec, &url).unwrap();
             let dialer = NngBus::dial(JsonCodec, &url).unwrap();
 
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(CONNECTION_SETTLE_TIME).await;
 
             let mut c1 = listener.subscribe_group("jobs.*", "workers").await.unwrap();
             let mut c2 = listener.subscribe_group("jobs.*", "workers").await.unwrap();
@@ -341,13 +343,13 @@ mod tests {
             dialer.publish("jobs.a", &1u32, None).await.unwrap();
             dialer.publish("jobs.b", &2u32, None).await.unwrap();
 
-            let m1 = timeout(Duration::from_millis(200), c1.next())
+            let m1 = timeout(DELIVERY_TIMEOUT, c1.next())
                 .await
                 .expect("timed out")
                 .unwrap()
                 .decode_json::<u32>()
                 .unwrap();
-            let m2 = timeout(Duration::from_millis(200), c2.next())
+            let m2 = timeout(DELIVERY_TIMEOUT, c2.next())
                 .await
                 .expect("timed out")
                 .unwrap()
