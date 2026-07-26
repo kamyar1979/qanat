@@ -4,7 +4,7 @@ Qanat Router is an async Rust routing library for in-process messages, external
 message brokers, and HTTP handlers. It provides one `Bus` abstraction across
 backends while keeping serialization outside the in-memory bus.
 
-The crates.io package is named `qanat-router`; the Rust library name remains
+The crates.io package is named `qanat-routing`; the Rust library name remains
 `qanat`.
 
 > This project is currently in beta. Public APIs may change before `1.0`.
@@ -27,7 +27,7 @@ external broker dependency:
 
 ```toml
 [dependencies]
-qanat-router = "0.1.0-beta.2"
+qanat-routing = "0.1.0-beta.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 ```
@@ -36,7 +36,7 @@ Enable only the integrations required by the application:
 
 ```toml
 [dependencies]
-qanat-router = { version = "0.1.0-beta.2", features = ["nats", "axum"] }
+qanat-routing = { version = "0.1.0-beta.2", features = ["nats", "axum"] }
 ```
 
 ## In-Memory Bus

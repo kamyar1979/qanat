@@ -54,7 +54,7 @@ jobs:
         shell: bash
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
-          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "qanat-router") | .version')"
+          crate_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "qanat-routing") | .version')"
 
           if [[ "$tag_version" != "$crate_version" ]]; then
             echo "Tag version '$tag_version' does not match crate version '$crate_version'."
