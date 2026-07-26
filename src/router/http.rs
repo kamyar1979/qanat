@@ -107,9 +107,11 @@ impl Default for HttpRouter<JsonCodec> {
 mod tests {
     use super::*;
     use axum::Json;
+    use axum::body::{Body, to_bytes};
     use axum::extract::{Path, Query};
-    use axum::http::StatusCode;
+    use axum::http::{Request, StatusCode};
     use serde::{Deserialize, Serialize};
+    use tower::ServiceExt;
 
     #[derive(Deserialize)]
     struct CreateOrder {
@@ -162,5 +164,32 @@ mod tests {
         let router = HttpRouter::with_codec(crate::codec::JsonCodec).get("/health", health);
 
         let _: &crate::codec::JsonCodec = router.codec();
+    }
+
+    #[tokio::test]
+    async fn http_router_executes_axum_extractors_and_handler() {
+        let router = HttpRouter::new()
+            .post("/orders/{id}", create_order)
+            .into_router();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/orders/17?include_events=true")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"sku":"ABC-123"}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "id": 17,
+                "sku": "ABC-123",
+                "include_events": true
+            })
+        );
     }
 }

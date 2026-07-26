@@ -16,7 +16,7 @@ use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, Consumer, ExchangeKind, Queue,
 };
 
-use crate::bus::RawBus;
+use crate::bus::ExternalBus;
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::{BackendError, BusError};
 use crate::message::Envelope;
@@ -95,9 +95,9 @@ impl<C: Codec> RabbitMqBus<C> {
     }
 }
 
-impl<C: Codec + 'static> RawBus for RabbitMqBus<C> {
+impl<C: Codec + 'static> ExternalBus for RabbitMqBus<C> {
     type Codec = C;
-    type RawSubscription = RabbitMqStream;
+    type Subscription = RabbitMqStream;
 
     fn codec(&self) -> &Self::Codec {
         &self.codec
@@ -126,7 +126,7 @@ impl<C: Codec + 'static> RawBus for RabbitMqBus<C> {
         }
     }
 
-    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError> {
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
         let queue = self.declare_subscription_queue().await?;
         let binding_key = rabbit_binding_key(pattern)?;
         self.channel
@@ -147,7 +147,7 @@ impl<C: Codec + 'static> RawBus for RabbitMqBus<C> {
         &self,
         pattern: &str,
         group: &str,
-    ) -> Result<Self::RawSubscription, BusError> {
+    ) -> Result<Self::Subscription, BusError> {
         let binding_key = rabbit_binding_key(pattern)?;
 
         self.channel

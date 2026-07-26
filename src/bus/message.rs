@@ -13,7 +13,7 @@ pub struct Envelope {
     pub attempts: u32,
 }
 
-/// Type-erased message used by `InternalBus`. Payload travels as `Arc<dyn Any>`
+/// Type-erased message used by `InMemoryBus`. Payload travels as `Arc<dyn Any>`
 /// so no serialization is needed for in-process delivery.
 #[derive(Clone)]
 pub struct AnyMessage {
@@ -47,5 +47,40 @@ impl AnyMessage {
                 payload: arc_any,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(payload: impl Any + Send + Sync) -> AnyMessage {
+        AnyMessage {
+            envelope: Envelope {
+                subject: "orders.created".to_string(),
+                timestamp: Instant::now(),
+                id: 7,
+                headers: None,
+                attempts: 0,
+            },
+            payload: Arc::new(payload),
+        }
+    }
+
+    #[test]
+    fn downcast_returns_typed_payload_and_preserves_envelope() {
+        let message = message(42u32).downcast::<u32>().unwrap();
+
+        assert_eq!(message.envelope.subject, "orders.created");
+        assert_eq!(message.envelope.id, 7);
+        assert_eq!(*message.payload, 42);
+    }
+
+    #[test]
+    fn failed_downcast_returns_the_original_message() {
+        let message = message(42u32).downcast::<String>().err().unwrap();
+
+        assert_eq!(message.envelope.id, 7);
+        assert_eq!(*message.downcast::<u32>().unwrap().payload, 42);
     }
 }

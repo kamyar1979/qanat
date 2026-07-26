@@ -1614,6 +1614,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "tower",
  "uuid",
 ]
 

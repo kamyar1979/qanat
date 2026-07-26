@@ -1,10 +1,13 @@
+// Explicit `impl Future + Send` return types are part of the public async trait contract.
+#![allow(clippy::manual_async_fn)]
+
 pub mod bus;
 pub mod errors;
 pub mod http;
 pub mod router;
 
 pub use bus::codec;
-pub use bus::internal_bus;
+pub use bus::in_memory_bus;
 pub(crate) use bus::internal_router;
 #[cfg(any(feature = "nng", feature = "redis"))]
 pub(crate) use bus::local_router;
@@ -20,14 +23,14 @@ pub use bus::raw_message;
 pub use bus::redis_bus;
 #[cfg(any(feature = "nng", feature = "redis"))]
 pub(crate) use bus::wire;
-pub use bus::{Bus, RawBus};
+pub use bus::{Bus, ExternalBus};
 
 #[cfg(test)]
 mod tests {
-    use super::internal_bus::InternalBus;
+    use super::in_memory_bus::InMemoryBus;
     use crate::bus::Bus;
     #[cfg(feature = "nng")]
-    use crate::bus::RawBus;
+    use crate::bus::ExternalBus;
     use crate::errors::BusError;
     use futures::StreamExt;
     use std::time::Duration;
@@ -37,7 +40,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wildcard_gt_does_not_match_bare_prefix() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut sub = bus.subscribe("foo.>").await.unwrap();
         bus.publish("foo", 1u32, None).await.unwrap();
         let result = timeout(Duration::from_millis(50), sub.next()).await;
@@ -46,7 +49,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wildcard_gt_matches_multiple_levels() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut sub = bus.subscribe("foo.>").await.unwrap();
         bus.publish("foo.bar.baz", 7u32, None).await.unwrap();
         let val = sub.next().await.unwrap().downcast::<u32>().unwrap();
@@ -55,7 +58,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wildcard_gt_alone_matches_any_subject() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut sub = bus.subscribe(">").await.unwrap();
         bus.publish("a.b.c.d", 42u32, None).await.unwrap();
         let val = sub.next().await.unwrap().downcast::<u32>().unwrap();
@@ -66,7 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wildcard_star_does_not_match_fewer_tokens() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut sub = bus.subscribe("foo.*").await.unwrap();
         bus.publish("foo", 1u32, None).await.unwrap();
         let result = timeout(Duration::from_millis(50), sub.next()).await;
@@ -75,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wildcard_star_does_not_match_more_tokens() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut sub = bus.subscribe("foo.*").await.unwrap();
         bus.publish("foo.bar.baz", 1u32, None).await.unwrap();
         let result = timeout(Duration::from_millis(50), sub.next()).await;
@@ -86,13 +89,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_with_no_group_subscribers_does_not_panic() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         assert!(bus.publish("jobs.run", "task", None).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_subscribe_group_conflicting_pattern_returns_error() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let _sub = bus.subscribe_group("jobs.*", "workers").await.unwrap();
         assert!(matches!(
             bus.subscribe_group("tasks.*", "workers").await,
@@ -102,14 +105,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_group_same_pattern_is_idempotent() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let _sub = bus.subscribe_group("jobs.*", "workers").await.unwrap();
         assert!(bus.subscribe_group("jobs.*", "workers").await.is_ok());
     }
 
     #[tokio::test]
     async fn test_queue_group_round_robin_cycles() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
         let mut c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
 
@@ -135,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropped_subscription_does_not_affect_later_publishes() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         {
             let _sub = bus.subscribe("foo.bar").await.unwrap();
         }
@@ -146,7 +149,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fanout_subscribers_receive_all_messages() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut sub1 = bus.subscribe("foo.bar").await.unwrap();
         let mut sub2 = bus.subscribe("foo.bar").await.unwrap();
 
@@ -173,7 +176,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_group_round_robin() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut c1 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
         let mut c2 = bus.subscribe_group("jobs.*", "workers").await.unwrap();
 
@@ -190,7 +193,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wildcard_matching() {
-        let bus = InternalBus::new();
+        let bus = InMemoryBus::new();
         let mut sub = bus.subscribe("foo.*").await.unwrap();
         bus.publish("foo.bar", 999i32, None).await.unwrap();
         let val = *sub.next().await.unwrap().downcast::<i32>().unwrap().payload;

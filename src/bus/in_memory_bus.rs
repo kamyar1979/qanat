@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-pub struct InternalBus {
+pub struct InMemoryBus {
     router: RouterHandle<AnyMessage>,
     next_msg_id: AtomicU64,
 }
 
-impl InternalBus {
+impl InMemoryBus {
     pub fn new() -> Self {
         Self {
             router: RouterHandle::new(),
@@ -43,7 +43,13 @@ impl InternalBus {
     }
 }
 
-impl Bus for InternalBus {
+impl Default for InMemoryBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Bus for InMemoryBus {
     type Message = AnyMessage;
     type Subscription = BusStream<AnyMessage>;
 
@@ -65,5 +71,54 @@ impl Bus for InternalBus {
         group: &str,
     ) -> Result<Self::Subscription, BusError> {
         self.router.subscribe_group(pattern, group).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn publish_preserves_envelope_metadata_and_increments_ids() {
+        let bus = InMemoryBus::new();
+        let mut subscription = bus.subscribe("orders.created").await.unwrap();
+        let headers = HashMap::from([("trace_id".to_string(), "trace-1".to_string())]);
+
+        bus.publish("orders.created", 41u32, Some(headers.clone()))
+            .await
+            .unwrap();
+        bus.publish("orders.created", 42u32, None).await.unwrap();
+
+        let first = subscription.next().await.unwrap();
+        let second = subscription.next().await.unwrap();
+
+        assert_eq!(first.envelope.subject.as_str(), "orders.created");
+        assert_eq!(first.envelope.id, 1);
+        assert_eq!(first.envelope.headers.as_ref(), Some(&headers));
+        assert_eq!(first.envelope.attempts, 0);
+        assert_eq!(*first.downcast::<u32>().unwrap().payload, 41);
+
+        assert_eq!(second.envelope.id, 2);
+        assert!(second.envelope.headers.is_none());
+        assert_eq!(*second.downcast::<u32>().unwrap().payload, 42);
+    }
+
+    #[tokio::test]
+    async fn default_constructs_a_working_bus() {
+        let bus = InMemoryBus::default();
+        let mut subscription = bus.subscribe("health.ready").await.unwrap();
+
+        bus.publish("health.ready", true, None).await.unwrap();
+
+        assert!(
+            *subscription
+                .next()
+                .await
+                .unwrap()
+                .downcast::<bool>()
+                .unwrap()
+                .payload
+        );
     }
 }

@@ -1,4 +1,4 @@
-use crate::bus::{BusStream, RawBus};
+use crate::bus::{BusStream, ExternalBus};
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
 use crate::local_router::LocalRouter;
@@ -68,23 +68,19 @@ impl<C: Codec + 'static> NngBus<C> {
 
         let inner_recv = Arc::clone(&inner);
         std::thread::spawn(move || {
-            loop {
-                match inner_recv.socket.recv() {
-                    Ok(msg) => {
-                        if let Some(frame) = wire::decode(&msg) {
-                            if bridge_tx
-                                .blocking_send((
-                                    frame.subject.to_string(),
-                                    frame.headers,
-                                    Bytes::copy_from_slice(frame.payload),
-                                ))
-                                .is_err()
-                            {
-                                break; // tokio side dropped
-                            }
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(msg) = inner_recv.socket.recv() {
+                let Some(frame) = wire::decode(&msg) else {
+                    continue;
+                };
+                if bridge_tx
+                    .blocking_send((
+                        frame.subject.to_string(),
+                        frame.headers,
+                        Bytes::copy_from_slice(frame.payload),
+                    ))
+                    .is_err()
+                {
+                    break; // tokio side dropped
                 }
             }
         });
@@ -107,9 +103,9 @@ impl<C: Codec + 'static> NngBus<C> {
     }
 }
 
-impl<C: Codec> RawBus for NngBus<C> {
+impl<C: Codec> ExternalBus for NngBus<C> {
     type Codec = C;
-    type RawSubscription = BusStream<RawMessage>;
+    type Subscription = BusStream<RawMessage>;
 
     fn codec(&self) -> &Self::Codec {
         &self.inner.local.codec
@@ -125,7 +121,7 @@ impl<C: Codec> RawBus for NngBus<C> {
 
         async move {
             let payload = payload?;
-            RawBus::publish_bytes(self, subject, payload.clone(), headers.clone()).await?;
+            ExternalBus::publish_bytes(self, subject, payload.clone(), headers.clone()).await?;
 
             let message = RawMessage {
                 envelope: Envelope {
@@ -164,7 +160,7 @@ impl<C: Codec> RawBus for NngBus<C> {
         msg: RawMessage,
     ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
         async move {
-            RawBus::publish_bytes(
+            ExternalBus::publish_bytes(
                 self,
                 subject,
                 msg.payload.clone(),
@@ -175,7 +171,7 @@ impl<C: Codec> RawBus for NngBus<C> {
         }
     }
 
-    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError> {
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
         self.inner.local.subscribe(pattern).await
     }
 
@@ -183,7 +179,7 @@ impl<C: Codec> RawBus for NngBus<C> {
         &self,
         pattern: &str,
         group: &str,
-    ) -> Result<Self::RawSubscription, BusError> {
+    ) -> Result<Self::Subscription, BusError> {
         self.inner.local.subscribe_group(pattern, group).await
     }
 }

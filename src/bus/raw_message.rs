@@ -21,3 +21,40 @@ impl RawMessage {
         self.decode(&crate::codec::JsonCodec)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{Codec, JsonCodec};
+    use std::time::Instant;
+
+    fn raw_message(payload: Bytes) -> RawMessage {
+        RawMessage {
+            envelope: Envelope {
+                subject: "orders.created".to_string(),
+                timestamp: Instant::now(),
+                id: 1,
+                headers: None,
+                attempts: 0,
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn decode_uses_the_supplied_codec() {
+        let message = raw_message(JsonCodec.encode(&42u32).unwrap());
+
+        assert_eq!(message.decode::<u32>(&JsonCodec).unwrap(), 42);
+    }
+
+    #[test]
+    fn decode_json_reports_invalid_payloads() {
+        let message = raw_message(Bytes::from_static(b"not json"));
+
+        assert!(matches!(
+            message.decode_json::<u32>(),
+            Err(BusError::Serialization(_))
+        ));
+    }
+}

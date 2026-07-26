@@ -1,4 +1,4 @@
-use crate::bus::{BusStream, RawBus};
+use crate::bus::{BusStream, ExternalBus};
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::{BackendError, BusError};
 use crate::local_router::LocalRouter;
@@ -81,9 +81,9 @@ impl<C: Codec + 'static> RedisBus<C> {
     }
 }
 
-impl<C: Codec> RawBus for RedisBus<C> {
+impl<C: Codec> ExternalBus for RedisBus<C> {
     type Codec = C;
-    type RawSubscription = BusStream<RawMessage>;
+    type Subscription = BusStream<RawMessage>;
 
     fn codec(&self) -> &Self::Codec {
         &self.inner.local.codec
@@ -107,7 +107,7 @@ impl<C: Codec> RawBus for RedisBus<C> {
         }
     }
 
-    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError> {
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
         self.inner.local.subscribe(pattern).await
     }
 
@@ -115,7 +115,7 @@ impl<C: Codec> RawBus for RedisBus<C> {
         &self,
         pattern: &str,
         group: &str,
-    ) -> Result<Self::RawSubscription, BusError> {
+    ) -> Result<Self::Subscription, BusError> {
         self.inner.local.subscribe_group(pattern, group).await
     }
 }

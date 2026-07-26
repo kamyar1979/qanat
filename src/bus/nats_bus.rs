@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use futures::Stream;
 
-use crate::bus::RawBus;
+use crate::bus::ExternalBus;
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::{BackendError, BusError};
 use crate::message::Envelope;
@@ -105,9 +105,9 @@ impl Stream for NatsStream {
     }
 }
 
-impl<C: Codec + 'static> RawBus for NatsBus<C> {
+impl<C: Codec + 'static> ExternalBus for NatsBus<C> {
     type Codec = C;
-    type RawSubscription = NatsStream;
+    type Subscription = NatsStream;
 
     fn codec(&self) -> &Self::Codec {
         &self.codec
@@ -136,7 +136,7 @@ impl<C: Codec + 'static> RawBus for NatsBus<C> {
         }
     }
 
-    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::RawSubscription, BusError> {
+    async fn subscribe_raw(&self, pattern: &str) -> Result<Self::Subscription, BusError> {
         let sub = self
             .client
             .subscribe(pattern.to_string())
@@ -149,7 +149,7 @@ impl<C: Codec + 'static> RawBus for NatsBus<C> {
         &self,
         pattern: &str,
         group: &str,
-    ) -> Result<Self::RawSubscription, BusError> {
+    ) -> Result<Self::Subscription, BusError> {
         let sub = self
             .client
             .queue_subscribe(pattern.to_string(), group.to_string())
