@@ -1597,8 +1597,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "qanat"
-version = "0.1.0"
+name = "qanat-router"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-nats",
  "axum",

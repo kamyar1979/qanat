@@ -1,10 +1,13 @@
 [package]
-name = "qanat"
-version = "0.1.0"
+name = "qanat-router"
+version = "0.1.0-beta.1"
 edition = "2024"
-description = "Extensible async routing for in-memory and external message buses"
+description = "Extensible async routing for message buses and HTTP services"
 license = "Apache-2.0"
 repository = "https://github.com/kamyar1979/qanat"
+
+[lib]
+name = "qanat"
 
 [features]
 default = []
