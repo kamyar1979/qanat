@@ -152,6 +152,65 @@ async fn main() -> Result<(), qanat::errors::BusError> {
 Handlers can extract the decoded body, complete broker envelope, all headers,
 individual typed headers, or the raw message.
 
+## Request/Reply Proxy
+
+`BrokerProxy` provides typed request/reply calls over the configured bus. A
+proxy is built synchronously and initializes its reply subscription lazily on
+the first `call`.
+
+```rust,no_run
+use std::time::Duration;
+
+use qanat::{
+    codec::JsonCodec,
+    nats_bus::NatsBus,
+    router::{BrokerRoute, BrokerRouter},
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+struct ProcessOrder {
+    id: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct OrderProcessed {
+    id: u64,
+}
+
+async fn process_order(order: ProcessOrder) -> OrderProcessed {
+    OrderProcessed { id: order.id }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), qanat::errors::BusError> {
+    let bus = NatsBus::connect(JsonCodec, "nats://localhost:4222").await?;
+    let mut router = BrokerRouter::new(bus).bind(
+        "orders.process",
+        "order-workers",
+        process_order,
+    );
+    let proxy = router
+        .proxy(BrokerRoute::new("orders.process", "order-workers"))
+        .timeout(Duration::from_secs(5));
+
+    router.install().await?;
+
+    let response: OrderProcessed = proxy.call(&ProcessOrder { id: 42 }).await?;
+    assert_eq!(response.id, 42);
+    Ok(())
+}
+```
+
+Each call gets a UUID correlation ID. By default, each proxy instance also gets
+its own reply subject under `_qanat.reply`, preventing another service instance
+from consuming its response. The bound handler preserves the correlation ID
+and replies to the subject supplied by the caller.
+
+Use `call_with_headers` to attach application headers. Use `.reply_to(...)` for
+a fixed reply subject or `.reply_topic_prefix(...)` to replace the default
+instance-specific prefix.
+
 ## HTTP Routing
 
 With the `axum` feature, `HttpRouter` accepts native Axum handlers and
