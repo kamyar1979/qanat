@@ -144,8 +144,10 @@ mod tests {
         id: u64,
     }
 
-    async fn handle_test_message(message: TestMessage) -> TestMessage {
-        message
+    async fn handle_test_message(
+        message: TestMessage,
+    ) -> Result<TestMessage, std::convert::Infallible> {
+        Ok(message)
     }
 
     #[test]

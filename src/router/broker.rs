@@ -600,8 +600,9 @@ mod tests {
         }
     }
 
-    async fn handle_test_message(message: TestMessage) {
+    async fn handle_test_message(message: TestMessage) -> Result<(), std::convert::Infallible> {
         let _ = message.id;
+        Ok(())
     }
 
     fn raw_message(
@@ -769,7 +770,7 @@ mod tests {
                 let called = Arc::clone(&called_by_handler);
                 async move {
                     called.fetch_add(1, Ordering::Relaxed);
-                    TestReply { id: message.id + 1 }
+                    Ok::<_, std::convert::Infallible>(TestReply { id: message.id + 1 })
                 }
             })
             .from(BrokerSource::new(
@@ -834,6 +835,7 @@ mod tests {
                 let seen = Arc::clone(&seen_by_handler);
                 async move {
                     seen.fetch_add(message.id as usize, Ordering::Relaxed);
+                    Ok::<_, std::convert::Infallible>(())
                 }
             })
             .from(BrokerSource::new(
@@ -867,7 +869,9 @@ mod tests {
         let bus = LoopbackBus::default();
         let mut replies = bus.subscribe("orders.processed").await.unwrap();
         let mut router = crate::router::Router::new()
-            .bind(|message: TestMessage| async move { TestReply { id: message.id + 1 } })
+            .bind(|message: TestMessage| async move {
+                Ok::<_, std::convert::Infallible>(TestReply { id: message.id + 1 })
+            })
             .from(BrokerSource::new(
                 bus.clone(),
                 "orders.created",
@@ -898,7 +902,9 @@ mod tests {
         let bus = LoopbackBus::default();
         let mut replies = bus.subscribe("instance.reply.7").await.unwrap();
         let mut router = crate::router::Router::new()
-            .bind(|message: TestMessage| async move { TestReply { id: message.id + 1 } })
+            .bind(|message: TestMessage| async move {
+                Ok::<_, std::convert::Infallible>(TestReply { id: message.id + 1 })
+            })
             .from(BrokerSource::new(
                 bus.clone(),
                 "orders.created",
@@ -948,6 +954,7 @@ mod tests {
                     let seen = seen.clone();
                     async move {
                         seen.send((correlation.0, message.id)).await.unwrap();
+                        Ok::<_, std::convert::Infallible>(())
                     }
                 },
             )
@@ -1027,7 +1034,7 @@ mod tests {
                 |mut headers: crate::router::RouteHeaders, message: TestMessage| async move {
                     headers.remove("x-internal");
                     headers.insert("x-processed-by".into(), "orders-service".into());
-                    (headers, TestReply { id: message.id + 1 })
+                    Ok::<_, std::convert::Infallible>((headers, TestReply { id: message.id + 1 }))
                 },
             )
             .from(BrokerSource::new(bus, "orders.created", "orders.in"))
@@ -1074,5 +1081,97 @@ mod tests {
             Some("orders-service")
         );
         assert!(!request.headers.contains_key("x-internal"));
+    }
+
+    #[tokio::test]
+    async fn fallible_handler_can_route_failure_to_broker_target() {
+        let bus = LoopbackBus::default();
+        let mut errors = bus.subscribe("orders.errors").await.unwrap();
+        let mut router =
+            crate::router::Router::new()
+                .bind(|_message: TestMessage| async move {
+                    Result::<TestReply, _>::Err("order rejected")
+                })
+                .errors_to(BrokerTarget::new(bus.clone(), "orders.errors"))
+                .from(BrokerSource::new(
+                    bus.clone(),
+                    "orders.created",
+                    "orders.in",
+                ))
+                .to(BrokerTarget::new(bus.clone(), "orders.processed"));
+        router.install().await.unwrap();
+
+        bus.dispatch(
+            "orders.created",
+            raw_message(
+                "orders.created",
+                router.codec().encode(&TestMessage { id: 41 }).unwrap(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), errors.next())
+            .await
+            .expect("broker error target was not invoked")
+            .expect("broker error subscription ended");
+        let failure: crate::router::RouteFailure = router.codec().decode(&error.payload).unwrap();
+
+        assert_eq!(error.envelope.subject, "orders.errors");
+        assert_eq!(failure.error.stage, crate::router::RouteErrorStage::Handler);
+        assert!(failure.error.message.contains("order rejected"));
+        assert_eq!(failure.original.address, "orders.created");
+    }
+
+    #[tokio::test]
+    async fn failed_http_delivery_can_route_failure_to_http_target() {
+        let bus = LoopbackBus::default();
+        let input_bus = bus.clone();
+        let failed_target = HttpTarget::post("http://orders.test/events", |_| async move {
+            Ok(crate::http::HttpResponse::new(503))
+        });
+        let (error_requests, mut error_rx) = mpsc::channel(1);
+        let error_target = HttpTarget::post("http://orders.test/errors", move |request| {
+            let error_requests = error_requests.clone();
+            async move {
+                error_requests.send(request).await.unwrap();
+                Ok(crate::http::HttpResponse::new(202))
+            }
+        });
+        let mut router = crate::router::Router::new()
+            .bind(|message: TestMessage| async move {
+                Ok::<_, std::convert::Infallible>(TestReply { id: message.id + 1 })
+            })
+            .errors_to(error_target)
+            .from(BrokerSource::new(bus, "orders.created", "orders.in"))
+            .to(failed_target);
+        router.install().await.unwrap();
+
+        input_bus
+            .dispatch(
+                "orders.created",
+                raw_message(
+                    "orders.created",
+                    router.codec().encode(&TestMessage { id: 41 }).unwrap(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let request = tokio::time::timeout(Duration::from_secs(1), error_rx.recv())
+            .await
+            .expect("HTTP error target was not invoked")
+            .expect("HTTP error target channel closed");
+        let failure: crate::router::RouteFailure = router.codec().decode(&request.body).unwrap();
+
+        assert_eq!(request.url, "http://orders.test/errors");
+        assert_eq!(
+            failure.error.stage,
+            crate::router::RouteErrorStage::Delivery
+        );
+        assert!(failure.error.message.contains("status 503"));
+        assert_eq!(failure.original.address, "orders.created");
     }
 }

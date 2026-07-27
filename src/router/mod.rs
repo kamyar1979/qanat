@@ -20,7 +20,7 @@ pub use config::{
     RouteManifest,
 };
 pub use core::{
-    Bind, FromRouteHeader, FromRouteMessage, IntoRouteHandler, RouteFrom, RouteHandler,
-    RouteHeader, RouteHeaders, RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget,
-    Router, TypedRouteHandler,
+    Bind, FailedRouteMessage, FromRouteHeader, FromRouteMessage, IntoRouteHandler, RouteError,
+    RouteErrorStage, RouteFailure, RouteFrom, RouteHandler, RouteHeader, RouteHeaders,
+    RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget, Router, TypedRouteHandler,
 };

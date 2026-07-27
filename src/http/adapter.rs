@@ -476,11 +476,11 @@ mod source_impl {
             let (outputs, mut output_rx) = mpsc::channel(1);
             let mut routes = Router::new()
                 .bind(|order: CreateOrder| async move {
-                    OrderResponse {
+                    Ok::<_, std::convert::Infallible>(OrderResponse {
                         id: 42,
                         sku: order.sku,
                         include_events: false,
-                    }
+                    })
                 })
                 .from(source)
                 .to(CaptureTarget { outputs });
@@ -526,14 +526,14 @@ mod source_impl {
                      order: CreateOrder| async move {
                         headers.remove("x-internal");
                         headers.insert("x-processed-by".into(), "http-handler".into());
-                        (
+                        Ok::<_, std::convert::Infallible>((
                             headers,
                             OrderResponse {
                                 id: path.id,
                                 sku: order.sku,
                                 include_events: query.include_events,
                             },
-                        )
+                        ))
                     },
                 )
                 .from(source)
@@ -574,6 +574,54 @@ mod source_impl {
         }
 
         #[tokio::test]
+        async fn http_source_routes_handler_failure_to_broker_target() {
+            let source = HttpSource::post("/orders");
+            let http = HttpRouter::new().source(&source).into_router();
+            let (broker_outputs, mut broker_output_rx) = mpsc::channel(1);
+            let bus = RecordingBus {
+                outputs: broker_outputs,
+            };
+            let (success_outputs, _success_rx) = mpsc::channel(1);
+            let mut routes = Router::new()
+                .bind(|_order: CreateOrder| async move {
+                    Result::<OrderResponse, _>::Err("order rejected")
+                })
+                .errors_to(BrokerTarget::new(bus, "orders.errors"))
+                .from(source)
+                .to(CaptureTarget {
+                    outputs: success_outputs,
+                });
+            routes.install().await.unwrap();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/orders")
+                .header("content-type", "application/json")
+                .header("x-request-id", "request-42")
+                .body(Body::from(r#"{"sku":"ABC-123"}"#))
+                .unwrap();
+
+            let response = http.oneshot(request).await.unwrap();
+            let message =
+                tokio::time::timeout(std::time::Duration::from_secs(1), broker_output_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let failure: crate::router::RouteFailure =
+                routes.codec().decode(&message.payload).unwrap();
+            let headers = message.envelope.headers.unwrap();
+
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(message.envelope.subject, "orders.errors");
+            assert_eq!(failure.error.stage, crate::router::RouteErrorStage::Handler);
+            assert!(failure.error.message.contains("order rejected"));
+            assert_eq!(failure.original.address, "/orders");
+            assert_eq!(
+                headers.get("x-request-id").map(String::as_str),
+                Some("request-42")
+            );
+        }
+
+        #[tokio::test]
         async fn http_source_sends_handler_output_to_http_target() {
             let source = HttpSource::post("/orders");
             let http = HttpRouter::new().source(&source).into_router();
@@ -589,14 +637,14 @@ mod source_impl {
                 .bind(
                     |mut headers: crate::router::RouteHeaders, order: CreateOrder| async move {
                         headers.insert("x-processed-by".into(), "http-handler".into());
-                        (
+                        Ok::<_, std::convert::Infallible>((
                             headers,
                             OrderResponse {
                                 id: 42,
                                 sku: order.sku,
                                 include_events: false,
                             },
-                        )
+                        ))
                     },
                 )
                 .from(source)

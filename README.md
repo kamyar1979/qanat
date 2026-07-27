@@ -40,7 +40,7 @@ external broker dependency:
 
 ```toml
 [dependencies]
-qanat-routing = "0.1.0-beta.4"
+qanat-routing = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 ```
@@ -49,7 +49,7 @@ Enable only the integrations required by the application:
 
 ```toml
 [dependencies]
-qanat-routing = { version = "0.1.0-beta.4", features = ["nats", "axum", "http-client"] }
+qanat-routing = { version = "0.1.0", features = ["nats", "axum", "http-client"] }
 ```
 
 ## In-Memory Bus
@@ -146,8 +146,10 @@ struct OrderProcessed {
     id: u64,
 }
 
-async fn process_order(order: ProcessOrder) -> OrderProcessed {
-    OrderProcessed { id: order.id }
+async fn process_order(
+    order: ProcessOrder,
+) -> Result<OrderProcessed, std::convert::Infallible> {
+    Ok(OrderProcessed { id: order.id })
 }
 
 #[tokio::main]
@@ -186,19 +188,19 @@ async fn handle(
     mut headers: RouteHeaders,
     RoutePayload(raw_payload): RoutePayload,
     input: ProcessOrder,
-) -> (RouteHeaders, OrderProcessed) {
+) -> Result<(RouteHeaders, OrderProcessed), std::convert::Infallible> {
     headers.insert("x-processed-by".into(), "orders-service".into());
     headers.remove("x-internal-token");
 
-    (headers, OrderProcessed { id: input.id })
+    Ok((headers, OrderProcessed { id: input.id }))
 }
 ```
 
 Every `RouteSource` produces a `RouteMessage` containing `headers` and
 `payload`; every `RouteTarget` receives the same fields after handler
-processing. A plain handler return value preserves incoming headers
-automatically. Returning `(RouteHeaders, output)` replaces them with the
-returned, potentially modified headers.
+processing. Returning `Ok(output)` preserves incoming headers automatically.
+Returning `Ok((RouteHeaders, output))` replaces them with the returned,
+potentially modified headers.
 
 ### Broker Input to HTTP Output
 
@@ -226,8 +228,10 @@ struct OrderProcessed {
     id: u64,
 }
 
-async fn process_order(order: ProcessOrder) -> OrderProcessed {
-    OrderProcessed { id: order.id }
+async fn process_order(
+    order: ProcessOrder,
+) -> Result<OrderProcessed, std::convert::Infallible> {
+    Ok(OrderProcessed { id: order.id })
 }
 
 #[tokio::main]
@@ -295,12 +299,12 @@ async fn process_order(
     HttpPath(path): HttpPath<OrderPath>,
     HttpQuery(query): HttpQuery<OrderQuery>,
     order: ProcessOrder,
-) -> OrderProcessed {
-    OrderProcessed {
+) -> Result<OrderProcessed, std::convert::Infallible> {
+    Ok(OrderProcessed {
         id: path.id,
         sku: order.sku,
         include_events: query.include_events,
-    }
+    })
 }
 
 let source = HttpSource::post("/orders/{id}");
@@ -324,6 +328,40 @@ and returns HTTP `503` when its route receiver is no longer available.
 
 `RouteSource` and `RouteTarget` are public traits. Additional transports such as
 gRPC or WebSocket can integrate without changing `Router`.
+
+## Error Routing
+
+All bound handlers return `Result`. Add `errors_to` to send handler, codec, or
+target-delivery failures to another transport-neutral target:
+
+```rust,ignore
+async fn process_order(
+    order: ProcessOrder,
+) -> Result<OrderProcessed, OrderError> {
+    // Validate and process the order.
+    # unimplemented!()
+}
+
+let mut router = Router::new()
+    .bind(process_order)
+    .errors_to(BrokerTarget::new(bus.clone(), "orders.errors"))
+    .from(BrokerSource::new(
+        bus.clone(),
+        "orders.process",
+        "order-workers",
+    ))
+    .to(BrokerTarget::new(bus, "orders.processed"));
+```
+
+The error target can be any `RouteTarget`, including `BrokerTarget`,
+`HttpTarget`, or a user-defined target. It receives an encoded `RouteFailure`
+containing a transport-neutral `RouteError` and the original address, headers,
+metadata, and payload. Routing headers pass through to the error target.
+
+For an HTTP source, `202 Accepted` means the request was admitted for
+asynchronous processing. A later handler or delivery failure can still be sent
+to the configured broker or HTTP error target. Failure of the error target
+itself is terminal and is not routed recursively.
 
 ## Request/Reply Proxy
 
@@ -351,8 +389,10 @@ struct OrderProcessed {
     id: u64,
 }
 
-async fn process_order(order: ProcessOrder) -> OrderProcessed {
-    OrderProcessed { id: order.id }
+async fn process_order(
+    order: ProcessOrder,
+) -> Result<OrderProcessed, std::convert::Infallible> {
+    Ok(OrderProcessed { id: order.id })
 }
 
 #[tokio::main]
