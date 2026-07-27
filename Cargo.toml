@@ -1,6 +1,6 @@
 [package]
 name = "qanat-routing"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 edition = "2024"
 description = "Extensible async routing for message buses and HTTP services"
 license = "Apache-2.0"
@@ -14,6 +14,7 @@ name = "qanat"
 default = []
 axum = ["dep:axum"]
 cbor = ["dep:ciborium"]
+http-client = ["dep:reqwest"]
 msgpack = ["dep:rmp-serde"]
 nats = ["dep:async-nats"]
 nng = ["dep:nng"]
@@ -34,6 +35,7 @@ axum = { version = "0.8", optional = true }
 ciborium = { version = "0.2", optional = true }
 nng = { version = "1.0", optional = true }
 redis = { version = "1.2.2", features = ["tokio-comp"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 rmp-serde = { version = "1", optional = true }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio"], optional = true }
 

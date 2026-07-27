@@ -87,7 +87,7 @@ jobs:
           done
 
       - name: Run core tests
-        run: cargo test --locked --features axum,cbor,msgpack -- --test-threads=1
+        run: cargo test --locked --features axum,cbor,http-client,msgpack -- --test-threads=1
 
       - name: Run NATS tests
         run: cargo test --locked --features nats bus::nats_bus::tests -- --test-threads=1

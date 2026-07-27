@@ -5,6 +5,10 @@ use serde::{Serialize, de::DeserializeOwned};
 pub trait Codec: Send + Sync + 'static {
     fn encode<T: Serialize>(&self, value: &T) -> Result<Bytes, BusError>;
     fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, BusError>;
+
+    fn content_type(&self) -> &'static str {
+        "application/octet-stream"
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -19,6 +23,10 @@ impl Codec for JsonCodec {
 
     fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, BusError> {
         serde_json::from_slice(bytes).map_err(|e| BusError::Serialization(e.to_string()))
+    }
+
+    fn content_type(&self) -> &'static str {
+        "application/json"
     }
 }
 
@@ -38,6 +46,10 @@ impl Codec for CborCodec {
     fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, BusError> {
         ciborium::de::from_reader(bytes).map_err(|e| BusError::Serialization(e.to_string()))
     }
+
+    fn content_type(&self) -> &'static str {
+        "application/cbor"
+    }
 }
 
 #[cfg(feature = "msgpack")]
@@ -54,6 +66,10 @@ impl Codec for MsgPackCodec {
 
     fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, BusError> {
         rmp_serde::from_slice(bytes).map_err(|e| BusError::Serialization(e.to_string()))
+    }
+
+    fn content_type(&self) -> &'static str {
+        "application/msgpack"
     }
 }
 

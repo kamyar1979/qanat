@@ -16,7 +16,8 @@ The crates.io package is named `qanat-routing`; the Rust library name remains
 - `*` and `>` subject wildcards
 - User-selected JSON, CBOR, or MessagePack codecs
 - NATS, NNG, RabbitMQ, and Redis backends
-- Typed broker handlers, replies, and request/reply proxies
+- A transport-neutral router with user-extensible sources and targets
+- Typed handlers, broker replies, and request/reply proxies
 - Axum routing without an extra HTTP abstraction layer
 - Optional dependencies for every external backend and non-JSON codec
 
@@ -27,7 +28,7 @@ external broker dependency:
 
 ```toml
 [dependencies]
-qanat-routing = "0.1.0-beta.3"
+qanat-routing = "0.1.0-beta.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 ```
@@ -36,7 +37,7 @@ Enable only the integrations required by the application:
 
 ```toml
 [dependencies]
-qanat-routing = { version = "0.1.0-beta.3", features = ["nats", "axum"] }
+qanat-routing = { version = "0.1.0-beta.4", features = ["nats", "axum", "http-client"] }
 ```
 
 ## In-Memory Bus
@@ -109,16 +110,17 @@ message:
 let jobs = bus.subscribe_group("jobs.*", "workers").await?;
 ```
 
-## Broker Handlers
+## Typed Routing
 
-`BrokerRouter` decodes a message into the handler's argument type and encodes
-its return value when a reply subject is configured.
+`Router` owns one codec and connects any `RouteSource` to any `RouteTarget`.
+`BrokerSource` and `BrokerTarget` adapt a `Bus`; user-defined transports can
+implement the same source and target traits.
 
 ```rust,no_run
 use qanat::{
     codec::JsonCodec,
     nats_bus::NatsBus,
-    router::BrokerRouter,
+    router::{BrokerSource, BrokerTarget, Router},
 };
 use serde::{Deserialize, Serialize};
 
@@ -139,9 +141,14 @@ async fn process_order(order: ProcessOrder) -> OrderProcessed {
 #[tokio::main]
 async fn main() -> Result<(), qanat::errors::BusError> {
     let bus = NatsBus::connect(JsonCodec, "nats://localhost:4222").await?;
-    let mut router = BrokerRouter::new(bus)
-        .bind("orders.process", "order-workers", process_order)
-        .reply_to("orders.processed");
+    let mut router = Router::new()
+        .bind(process_order)
+        .from(BrokerSource::new(
+            bus.clone(),
+            "orders.process",
+            "order-workers",
+        ))
+        .to(BrokerTarget::new(bus, "orders.processed"));
 
     router.install().await?;
     std::future::pending::<()>().await;
@@ -150,7 +157,64 @@ async fn main() -> Result<(), qanat::errors::BusError> {
 ```
 
 Handlers can extract the decoded body, complete broker envelope, all headers,
-individual typed headers, or the raw message.
+individual typed headers, or the raw broker message. The router codec is used
+for both decoding handler input and encoding handler output.
+
+### Broker Input to HTTP Output
+
+Use `.to(HttpTarget)` to deliver a broker handler's encoded return value to an
+HTTP endpoint. The router codec determines the request body and content type.
+Broker headers, including the correlation ID, are forwarded; the internal
+`reply_to` header is removed.
+
+```rust,no_run
+use qanat::{
+    codec::JsonCodec,
+    http::{HttpTarget, ReqwestHttpInvoker},
+    nats_bus::NatsBus,
+    router::{BrokerSource, Router},
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct ProcessOrder {
+    id: u64,
+}
+
+#[derive(Serialize)]
+struct OrderProcessed {
+    id: u64,
+}
+
+async fn process_order(order: ProcessOrder) -> OrderProcessed {
+    OrderProcessed { id: order.id }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), qanat::errors::BusError> {
+    let bus = NatsBus::connect(JsonCodec, "nats://localhost:4222").await?;
+    let target = HttpTarget::post(
+        "https://orders.example/events",
+        ReqwestHttpInvoker::new(),
+    );
+    let mut router = Router::new()
+        .bind(process_order)
+        .from(BrokerSource::new(
+            bus,
+            "orders.process",
+            "order-workers",
+        ))
+        .to(target);
+
+    router.install().await?;
+    std::future::pending::<()>().await;
+    Ok(())
+}
+```
+
+`HttpTarget` also accepts an async closure or a custom `HttpInvoker`
+implementation, allowing an existing HTTP client to be adapted without
+enabling `http-client`.
 
 ## Request/Reply Proxy
 
@@ -164,7 +228,7 @@ use std::time::Duration;
 use qanat::{
     codec::JsonCodec,
     nats_bus::NatsBus,
-    router::{BrokerRoute, BrokerRouter},
+    router::{BrokerProxy, BrokerRoute, BrokerSource, BrokerTarget, Router},
 };
 use serde::{Deserialize, Serialize};
 
@@ -185,13 +249,18 @@ async fn process_order(order: ProcessOrder) -> OrderProcessed {
 #[tokio::main]
 async fn main() -> Result<(), qanat::errors::BusError> {
     let bus = NatsBus::connect(JsonCodec, "nats://localhost:4222").await?;
-    let mut router = BrokerRouter::new(bus).bind(
-        "orders.process",
-        "order-workers",
-        process_order,
-    );
-    let proxy = router
-        .proxy(BrokerRoute::new("orders.process", "order-workers"))
+    let mut router = Router::new()
+        .bind(process_order)
+        .from(BrokerSource::new(
+            bus.clone(),
+            "orders.process",
+            "order-workers",
+        ))
+        .to(BrokerTarget::reply_to(bus.clone()));
+    let proxy = BrokerProxy::new(
+        bus,
+        BrokerRoute::new("orders.process", "order-workers"),
+    )
         .timeout(Duration::from_secs(5));
 
     router.install().await?;
@@ -247,6 +316,7 @@ the wire frame and use Qanat's local router after receipt.
 | Feature | Adds |
 | --- | --- |
 | `axum` | Axum `HttpRouter` |
+| `http-client` | Reqwest-backed outbound `HttpTarget` invoker |
 | `nats` | NATS backend |
 | `nng` | NNG Bus0 backend |
 | `rabbitmq` | RabbitMQ topic-exchange backend |

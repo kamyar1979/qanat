@@ -1,76 +1,85 @@
 use std::marker::PhantomData;
 
-use crate::bus::Bus;
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
-use crate::raw_message::RawMessage;
-use crate::router::broker::BrokerRouter;
+use crate::router::core::Router;
 #[cfg(feature = "axum")]
 use crate::router::http::HttpRouter;
 
-pub struct App<H: Codec = JsonCodec> {
+pub struct App<C: Codec = JsonCodec> {
+    routes: Option<Router<C>>,
     #[cfg(feature = "axum")]
-    http: Option<HttpRouter<H>>,
-    _http_codec: PhantomData<fn() -> H>,
+    http: Option<HttpRouter<C>>,
+    _codec: PhantomData<fn() -> C>,
 }
 
 impl App<JsonCodec> {
     pub fn new() -> Self {
         Self {
+            routes: None,
             #[cfg(feature = "axum")]
             http: None,
-            _http_codec: PhantomData,
+            _codec: PhantomData,
         }
     }
 }
 
-impl<H> App<H>
-where
-    H: Codec,
-{
-    pub fn broker<B, C>(self, broker: BrokerRouter<B, C>) -> BrokerApp<B, C, H>
-    where
-        B: Bus,
-        C: Codec,
-    {
-        BrokerApp {
-            broker,
+impl<C: Codec> App<C> {
+    pub fn with_router(router: Router<C>) -> Self {
+        Self {
+            routes: Some(router),
             #[cfg(feature = "axum")]
-            http: self.http,
-            _http_codec: PhantomData,
+            http: None,
+            _codec: PhantomData,
         }
     }
 
-    #[cfg(feature = "axum")]
-    pub fn http<H2>(self, http: HttpRouter<H2>) -> App<H2>
-    where
-        H2: Codec,
-    {
-        App {
-            http: Some(http),
-            _http_codec: PhantomData,
+    pub fn router(mut self, router: Router<C>) -> Self {
+        self.routes = Some(router);
+        self
+    }
+
+    pub fn routes(&self) -> Option<&Router<C>> {
+        self.routes.as_ref()
+    }
+
+    pub fn routes_mut(&mut self) -> Option<&mut Router<C>> {
+        self.routes.as_mut()
+    }
+
+    pub async fn install(&mut self) -> Result<(), BusError> {
+        if let Some(router) = self.routes.as_mut() {
+            router.install().await?;
         }
+        Ok(())
     }
 
     #[cfg(feature = "axum")]
-    pub fn http_router(&self) -> Option<&HttpRouter<H>> {
+    pub fn http(mut self, http: HttpRouter<C>) -> Self {
+        self.http = Some(http);
+        self
+    }
+
+    #[cfg(feature = "axum")]
+    pub fn http_router(&self) -> Option<&HttpRouter<C>> {
         self.http.as_ref()
     }
 
     #[cfg(feature = "axum")]
-    pub fn into_http_router(self) -> Option<HttpRouter<H>> {
+    pub fn into_http_router(self) -> Option<HttpRouter<C>> {
         self.http
     }
 
     pub fn router_count(&self) -> usize {
-        #[cfg(feature = "axum")]
-        {
-            usize::from(self.http.is_some())
-        }
-
-        #[cfg(not(feature = "axum"))]
-        {
-            0
+        usize::from(self.routes.is_some()) + {
+            #[cfg(feature = "axum")]
+            {
+                usize::from(self.http.is_some())
+            }
+            #[cfg(not(feature = "axum"))]
+            {
+                0
+            }
         }
     }
 }
@@ -81,117 +90,12 @@ impl Default for App<JsonCodec> {
     }
 }
 
-pub struct BrokerApp<B: Bus, C: Codec = JsonCodec, H: Codec = JsonCodec> {
-    broker: BrokerRouter<B, C>,
-    #[cfg(feature = "axum")]
-    http: Option<HttpRouter<H>>,
-    _http_codec: PhantomData<fn() -> H>,
-}
-
-impl<B, C, H> BrokerApp<B, C, H>
-where
-    B: Bus,
-    C: Codec,
-    H: Codec,
-{
-    pub fn broker_router(&self) -> &BrokerRouter<B, C> {
-        &self.broker
-    }
-
-    pub fn broker_router_mut(&mut self) -> &mut BrokerRouter<B, C> {
-        &mut self.broker
-    }
-
-    pub async fn install(&mut self) -> Result<(), BusError>
-    where
-        B: Bus<Message = RawMessage> + 'static,
-    {
-        self.broker.install().await
-    }
-
-    #[cfg(feature = "axum")]
-    pub fn http<H2>(self, http: HttpRouter<H2>) -> BrokerApp<B, C, H2>
-    where
-        H2: Codec,
-    {
-        BrokerApp {
-            broker: self.broker,
-            http: Some(http),
-            _http_codec: PhantomData,
-        }
-    }
-
-    #[cfg(feature = "axum")]
-    pub fn http_router(&self) -> Option<&HttpRouter<H>> {
-        self.http.as_ref()
-    }
-
-    #[cfg(feature = "axum")]
-    pub fn into_http_router(self) -> Option<HttpRouter<H>> {
-        self.http
-    }
-
-    pub fn router_count(&self) -> usize {
-        #[cfg(feature = "axum")]
-        {
-            1 + usize::from(self.http.is_some())
-        }
-
-        #[cfg(not(feature = "axum"))]
-        {
-            1
-        }
-    }
-}
-
-pub fn bind<F>(handler: F) -> HandlerBinding<F> {
-    HandlerBinding { handler }
-}
-
-pub struct HandlerBinding<F> {
-    handler: F,
-}
-
-impl<F> HandlerBinding<F> {
-    pub fn from<S>(self, source: S) -> RouteFrom<F, S> {
-        RouteFrom {
-            handler: self.handler,
-            source,
-        }
-    }
-}
-
-pub struct RouteFrom<F, S> {
-    handler: F,
-    source: S,
-}
-
-impl<F, S> RouteFrom<F, S> {
-    pub fn to<T>(self, target: T) -> RouteBinding<F, S, T> {
-        RouteBinding {
-            handler: self.handler,
-            source: self.source,
-            target,
-        }
-    }
-}
-
-pub struct RouteBinding<F, S, T> {
-    pub(crate) handler: F,
-    pub(crate) source: S,
-    pub(crate) target: T,
-}
-
-impl<F, S, T> RouteBinding<F, S, T> {
-    pub fn parts(&self) -> (&F, &S, &T) {
-        (&self.handler, &self.source, &self.target)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::Bus;
     use crate::raw_message::RawMessage;
+    use crate::router::{BrokerSource, BrokerTarget};
     use futures::stream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -206,10 +110,6 @@ mod tests {
             Self {
                 group_subscriptions: Arc::new(AtomicUsize::new(0)),
             }
-        }
-
-        fn group_subscription_count(&self) -> usize {
-            self.group_subscriptions.load(Ordering::Relaxed)
         }
     }
 
@@ -239,39 +139,42 @@ mod tests {
         }
     }
 
-    #[derive(serde::Deserialize)]
+    #[derive(serde::Deserialize, serde::Serialize)]
     struct TestMessage {
         id: u64,
     }
 
-    async fn handle_test_message(message: TestMessage) {
-        let _ = message.id;
+    async fn handle_test_message(message: TestMessage) -> TestMessage {
+        message
     }
 
     #[test]
     fn app_starts_without_routers() {
-        let app = App::new();
-
-        assert_eq!(app.router_count(), 0);
+        assert_eq!(App::new().router_count(), 0);
     }
 
     #[tokio::test]
-    async fn app_installs_broker_router() {
+    async fn app_installs_neutral_router() {
         let bus = FakeBus::new();
-        let broker =
-            BrokerRouter::new(bus.clone()).bind("orders.created", "orders.in", handle_test_message);
-        let mut app = App::new().broker(broker);
+        let router = Router::new()
+            .bind(handle_test_message)
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.created",
+                "orders.in",
+            ))
+            .to(BrokerTarget::new(bus.clone(), "orders.processed"));
+        let mut app = App::with_router(router);
 
-        assert_eq!(app.router_count(), 1);
         app.install().await.unwrap();
 
-        assert_eq!(app.broker_router().task_count(), 1);
-        assert_eq!(bus.group_subscription_count(), 1);
+        assert_eq!(app.routes().unwrap().task_count(), 1);
+        assert_eq!(bus.group_subscriptions.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(feature = "axum")]
     #[test]
-    fn app_accepts_http_router_with_explicit_codec() {
+    fn app_accepts_http_router_with_same_codec_type() {
         let app = App::new().http(HttpRouter::with_codec(crate::codec::JsonCodec));
 
         let _: &crate::codec::JsonCodec = app.http_router().unwrap().codec();

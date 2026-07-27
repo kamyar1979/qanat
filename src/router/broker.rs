@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -10,8 +8,9 @@ use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
+use crate::router::core::{FromRouteMessage, RouteMessage, RouteSource, RouteStream, RouteTarget};
 use futures::StreamExt;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, LocalBoxFuture};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 use uuid::Uuid;
@@ -74,337 +73,131 @@ impl BrokerRoute {
     }
 }
 
-struct BrokerBinding<C: Codec> {
-    route: BrokerRoute,
-    handler: Arc<dyn BrokerHandler<C>>,
-}
-
-pub struct BrokerRouter<B: Bus, C: Codec = JsonCodec> {
+pub struct BrokerSource<B: Bus> {
     bus: Arc<B>,
-    codec: Arc<C>,
-    bindings: Vec<BrokerBinding<C>>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    route: BrokerRoute,
 }
 
-impl<B: Bus> BrokerRouter<B, JsonCodec> {
-    pub fn new(bus: B) -> Self {
-        Self::with_codec(bus, JsonCodec)
-    }
-}
-
-impl<B, C> BrokerRouter<B, C>
-where
-    B: Bus,
-    C: Codec,
-{
-    pub fn with_codec(bus: B, codec: C) -> Self {
+impl<B: Bus> BrokerSource<B> {
+    pub fn new(bus: B, pattern: impl Into<String>, group: impl Into<String>) -> Self {
         Self {
             bus: Arc::new(bus),
-            codec: Arc::new(codec),
-            bindings: Vec::new(),
-            tasks: Vec::new(),
-        }
-    }
-
-    pub fn bind<H, Args>(
-        mut self,
-        pattern: impl Into<String>,
-        group: impl Into<String>,
-        handler: H,
-    ) -> Self
-    where
-        H: IntoBrokerHandler<C, Args>,
-        Args: Send + Sync + 'static,
-    {
-        self.bindings.push(BrokerBinding {
             route: BrokerRoute::new(pattern, group),
-            handler: handler.into_handler(),
-        });
-        self
+        }
     }
 
-    pub fn reply_to(mut self, reply_to: impl Into<String>) -> Self {
-        if let Some(binding) = self.bindings.last_mut() {
-            binding.route.reply_to = Some(reply_to.into());
-            binding.route.reply_topic_prefix = None;
+    pub fn from_shared(bus: Arc<B>, pattern: impl Into<String>, group: impl Into<String>) -> Self {
+        Self {
+            bus,
+            route: BrokerRoute::new(pattern, group),
         }
-        self
-    }
-
-    pub fn reply_topic_prefix(mut self, prefix: impl Into<String>) -> Self {
-        if let Some(binding) = self.bindings.last_mut() {
-            binding.route.reply_to = None;
-            binding.route.reply_topic_prefix = Some(prefix.into());
-        }
-        self
     }
 
     pub fn bus(&self) -> &B {
         self.bus.as_ref()
     }
 
-    pub fn codec(&self) -> &C {
-        &self.codec
+    pub fn route(&self) -> &BrokerRoute {
+        &self.route
     }
 
-    pub fn route_count(&self) -> usize {
-        self.bindings.len()
+    pub fn shared_bus(&self) -> Arc<B> {
+        Arc::clone(&self.bus)
     }
+}
 
-    pub fn routes(&self) -> impl ExactSizeIterator<Item = &BrokerRoute> {
-        self.bindings.iter().map(|binding| &binding.route)
-    }
-
-    pub fn task_count(&self) -> usize {
-        self.tasks.len()
-    }
-
-    pub fn proxy(&self, route: BrokerRoute) -> BrokerProxy<B, C> {
-        BrokerProxy::from_shared(Arc::clone(&self.bus), Arc::clone(&self.codec), route)
-    }
-
-    pub async fn install(&mut self) -> Result<(), BusError>
-    where
-        B: Bus<Message = RawMessage> + 'static,
-    {
-        for binding in self.bindings.iter() {
-            let route = binding.route.clone();
-            let handler = Arc::clone(&binding.handler);
-            let mut subscription = self
+impl<B> RouteSource for BrokerSource<B>
+where
+    B: Bus<Message = RawMessage> + 'static,
+{
+    fn subscribe(&self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>> {
+        Box::pin(async move {
+            let stream = self
                 .bus
-                .subscribe_group(&route.pattern, &route.group)
+                .subscribe_group(&self.route.pattern, &self.route.group)
                 .await?;
-            let codec = Arc::clone(&self.codec);
-            let bus = Arc::clone(&self.bus);
-
-            let task = tokio::spawn(async move {
-                while let Some(message) = subscription.next().await {
-                    if let Ok(Some((reply_subject, reply))) =
-                        handler.call(message, &route, codec.as_ref()).await
-                    {
-                        let _ = bus.dispatch(&reply_subject, reply).await;
-                    }
-                }
-            });
-            self.tasks.push(task);
-        }
-        Ok(())
+            Ok(Box::pin(stream.map(route_message_from_broker)) as RouteStream)
+        })
     }
 }
 
-pub trait BrokerHandler<C: Codec>: Send + Sync {
-    fn call<'a>(
-        &'a self,
-        message: RawMessage,
-        route: &'a BrokerRoute,
-        codec: &'a C,
-    ) -> BoxFuture<'a, Result<Option<(String, RawMessage)>, BusError>>;
-}
-
-pub trait IntoBrokerHandler<C: Codec, Args>: Send + Sync + 'static {
-    fn into_handler(self) -> Arc<dyn BrokerHandler<C>>;
-}
-
-pub struct TypedBrokerHandler<Args, O, F> {
-    handler: F,
-    _types: PhantomData<fn(Args) -> O>,
-}
-
-fn encode_handler_reply<O: Serialize>(
-    output: &O,
-    mut message: RawMessage,
-    route: &BrokerRoute,
-    codec: &impl Codec,
-) -> Result<Option<(String, RawMessage)>, BusError> {
-    let reply_to = message
-        .envelope
-        .headers
-        .as_ref()
-        .and_then(|headers| headers.get(REPLY_TO_HEADER))
-        .cloned()
-        .or_else(|| route.reply_to.clone());
-    let Some(reply_to) = reply_to else {
-        return Ok(None);
-    };
-
-    if let Some(headers) = message.envelope.headers.as_mut() {
-        headers.remove(REPLY_TO_HEADER);
+fn route_message_from_broker(message: RawMessage) -> RouteMessage {
+    RouteMessage {
+        address: message.envelope.subject,
+        timestamp: message.envelope.timestamp,
+        id: message.envelope.id,
+        headers: message.envelope.headers.unwrap_or_default(),
+        attempts: message.envelope.attempts,
+        payload: message.payload,
     }
+}
 
-    let reply = RawMessage {
+fn broker_message_from_route(message: RouteMessage) -> RawMessage {
+    RawMessage {
         envelope: Envelope {
-            subject: reply_to.clone(),
-            timestamp: std::time::Instant::now(),
-            id: message.envelope.id,
-            headers: message.envelope.headers,
-            attempts: 0,
+            subject: message.address,
+            timestamp: message.timestamp,
+            id: message.id,
+            headers: (!message.headers.is_empty()).then_some(message.headers),
+            attempts: message.attempts,
         },
-        payload: codec.encode(output)?,
-    };
-    Ok(Some((reply_to, reply)))
-}
-
-impl<Args, O, F> TypedBrokerHandler<Args, O, F> {
-    pub fn handler(&self) -> &F {
-        &self.handler
+        payload: message.payload,
     }
 }
 
-impl<C, A, O, F, Fut> IntoBrokerHandler<C, (A,)> for F
-where
-    C: Codec,
-    A: FromBrokerMessage<C> + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    F: Fn(A) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-{
-    fn into_handler(self) -> Arc<dyn BrokerHandler<C>> {
-        Arc::new(TypedBrokerHandler {
-            handler: self,
-            _types: PhantomData::<fn((A,)) -> O>,
-        })
+enum BrokerDestination {
+    Subject(String),
+    ReplyTo,
+}
+
+pub struct BrokerTarget<B: Bus> {
+    bus: Arc<B>,
+    destination: BrokerDestination,
+}
+
+impl<B: Bus> BrokerTarget<B> {
+    pub fn new(bus: B, subject: impl Into<String>) -> Self {
+        Self::from_shared(Arc::new(bus), subject)
     }
-}
 
-impl<C, A, B, O, F, Fut> IntoBrokerHandler<C, (A, B)> for F
-where
-    C: Codec,
-    A: FromBrokerMessage<C> + Send + Sync + 'static,
-    B: FromBrokerMessage<C> + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    F: Fn(A, B) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-{
-    fn into_handler(self) -> Arc<dyn BrokerHandler<C>> {
-        Arc::new(TypedBrokerHandler {
-            handler: self,
-            _types: PhantomData::<fn((A, B)) -> O>,
-        })
+    pub fn from_shared(bus: Arc<B>, subject: impl Into<String>) -> Self {
+        Self {
+            bus,
+            destination: BrokerDestination::Subject(subject.into()),
+        }
     }
-}
 
-impl<C, A, B, D, O, F, Fut> IntoBrokerHandler<C, (A, B, D)> for F
-where
-    C: Codec,
-    A: FromBrokerMessage<C> + Send + Sync + 'static,
-    B: FromBrokerMessage<C> + Send + Sync + 'static,
-    D: FromBrokerMessage<C> + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    F: Fn(A, B, D) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-{
-    fn into_handler(self) -> Arc<dyn BrokerHandler<C>> {
-        Arc::new(TypedBrokerHandler {
-            handler: self,
-            _types: PhantomData::<fn((A, B, D)) -> O>,
-        })
+    pub fn reply_to(bus: B) -> Self {
+        Self::reply_to_shared(Arc::new(bus))
     }
-}
 
-impl<A, O, F, Fut, C> BrokerHandler<C> for TypedBrokerHandler<(A,), O, F>
-where
-    A: FromBrokerMessage<C> + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    F: Fn(A) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-    C: Codec,
-{
-    fn call<'a>(
-        &'a self,
-        message: RawMessage,
-        route: &'a BrokerRoute,
-        codec: &'a C,
-    ) -> BoxFuture<'a, Result<Option<(String, RawMessage)>, BusError>> {
-        Box::pin(async move {
-            let output = (self.handler)(A::from_message(&message, codec)?).await;
-            encode_handler_reply(&output, message, route, codec)
-        })
+    pub fn reply_to_shared(bus: Arc<B>) -> Self {
+        Self {
+            bus,
+            destination: BrokerDestination::ReplyTo,
+        }
     }
-}
 
-impl<A, B, O, F, Fut, C> BrokerHandler<C> for TypedBrokerHandler<(A, B), O, F>
-where
-    A: FromBrokerMessage<C> + Send + Sync + 'static,
-    B: FromBrokerMessage<C> + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    F: Fn(A, B) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-    C: Codec,
-{
-    fn call<'a>(
-        &'a self,
-        message: RawMessage,
-        route: &'a BrokerRoute,
-        codec: &'a C,
-    ) -> BoxFuture<'a, Result<Option<(String, RawMessage)>, BusError>> {
-        Box::pin(async move {
-            let output = (self.handler)(
-                A::from_message(&message, codec)?,
-                B::from_message(&message, codec)?,
-            )
-            .await;
-            encode_handler_reply(&output, message, route, codec)
-        })
-    }
-}
-
-impl<A, B, D, O, F, Fut, C> BrokerHandler<C> for TypedBrokerHandler<(A, B, D), O, F>
-where
-    A: FromBrokerMessage<C> + Send + Sync + 'static,
-    B: FromBrokerMessage<C> + Send + Sync + 'static,
-    D: FromBrokerMessage<C> + Send + Sync + 'static,
-    O: Serialize + Send + Sync + 'static,
-    F: Fn(A, B, D) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-    C: Codec,
-{
-    fn call<'a>(
-        &'a self,
-        message: RawMessage,
-        route: &'a BrokerRoute,
-        codec: &'a C,
-    ) -> BoxFuture<'a, Result<Option<(String, RawMessage)>, BusError>> {
-        Box::pin(async move {
-            let output = (self.handler)(
-                A::from_message(&message, codec)?,
-                B::from_message(&message, codec)?,
-                D::from_message(&message, codec)?,
-            )
-            .await;
-            encode_handler_reply(&output, message, route, codec)
-        })
-    }
-}
-
-pub trait FromBrokerMessage<C: Codec>: Sized {
-    fn from_message(message: &RawMessage, codec: &C) -> Result<Self, BusError>;
-}
-
-impl<T, C> FromBrokerMessage<C> for T
-where
-    T: DeserializeOwned,
-    C: Codec,
-{
-    fn from_message(message: &RawMessage, codec: &C) -> Result<Self, BusError> {
-        codec.decode(&message.payload)
+    pub fn bus(&self) -> &B {
+        self.bus.as_ref()
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct BrokerEnvelope(pub Envelope);
 
-impl<C: Codec> FromBrokerMessage<C> for BrokerEnvelope {
-    fn from_message(message: &RawMessage, _codec: &C) -> Result<Self, BusError> {
-        Ok(Self(message.envelope.clone()))
+impl<C: Codec> FromRouteMessage<C> for BrokerEnvelope {
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        Ok(Self(broker_message_from_route(message.clone()).envelope))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrokerHeaders(pub std::collections::HashMap<String, String>);
 
-impl<C: Codec> FromBrokerMessage<C> for BrokerHeaders {
-    fn from_message(message: &RawMessage, _codec: &C) -> Result<Self, BusError> {
-        Ok(Self(message.envelope.headers.clone().unwrap_or_default()))
+impl<C: Codec> FromRouteMessage<C> for BrokerHeaders {
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        Ok(Self(message.headers.clone()))
     }
 }
 
@@ -417,18 +210,14 @@ pub trait FromBrokerHeader: Sized {
     fn from_header(value: &str) -> Result<Self, BusError>;
 }
 
-impl<T, C> FromBrokerMessage<C> for BrokerHeader<T>
+impl<T, C> FromRouteMessage<C> for BrokerHeader<T>
 where
     T: FromBrokerHeader,
     C: Codec,
 {
-    fn from_message(message: &RawMessage, _codec: &C) -> Result<Self, BusError> {
-        let headers = message
-            .envelope
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        let value = message
             .headers
-            .as_ref()
-            .ok_or_else(|| BusError::Internal("message has no headers".into()))?;
-        let value = headers
             .get(T::NAME)
             .ok_or_else(|| BusError::Internal(format!("missing broker header '{}'", T::NAME)))?;
         Ok(Self(T::from_header(value)?))
@@ -438,9 +227,41 @@ where
 #[derive(Clone, Debug)]
 pub struct BrokerRawMessage(pub RawMessage);
 
-impl<C: Codec> FromBrokerMessage<C> for BrokerRawMessage {
-    fn from_message(message: &RawMessage, _codec: &C) -> Result<Self, BusError> {
-        Ok(Self(message.clone()))
+impl<C: Codec> FromRouteMessage<C> for BrokerRawMessage {
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        Ok(Self(broker_message_from_route(message.clone())))
+    }
+}
+
+impl<B> RouteTarget for BrokerTarget<B>
+where
+    B: Bus<Message = RawMessage> + 'static,
+{
+    fn accepts(&self, message: &RouteMessage) -> bool {
+        match self.destination {
+            BrokerDestination::Subject(_) => true,
+            BrokerDestination::ReplyTo => message.headers.contains_key(REPLY_TO_HEADER),
+        }
+    }
+
+    fn deliver(&self, mut output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
+        Box::pin(async move {
+            let subject = match &self.destination {
+                BrokerDestination::Subject(subject) => subject.clone(),
+                BrokerDestination::ReplyTo => output
+                    .headers
+                    .get(REPLY_TO_HEADER)
+                    .cloned()
+                    .ok_or_else(|| {
+                        BusError::Internal("broker reply target requires a reply_to header".into())
+                    })?,
+            };
+            output.headers.remove(REPLY_TO_HEADER);
+            output.address = subject.clone();
+            self.bus
+                .dispatch(&subject, broker_message_from_route(output))
+                .await
+        })
     }
 }
 
@@ -740,9 +561,11 @@ mod tests {
     use super::*;
     use crate::bus::Bus;
     use crate::codec::Codec;
+    use crate::http::HttpTarget;
     use crate::message::Envelope;
     use futures::stream;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -940,6 +763,21 @@ mod tests {
         }
     }
 
+    struct CaptureTarget {
+        sender: mpsc::Sender<RouteMessage>,
+    }
+
+    impl RouteTarget for CaptureTarget {
+        fn deliver(&self, output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
+            Box::pin(async move {
+                self.sender
+                    .send(output)
+                    .await
+                    .map_err(|_| BusError::Internal("capture target closed".into()))
+            })
+        }
+    }
+
     #[test]
     fn broker_configuration_uses_python_equivalent_defaults() {
         let config = BrokerConfiguration::new("amqp://guest:guest@localhost:5672/%2f");
@@ -979,56 +817,53 @@ mod tests {
     }
 
     #[test]
-    fn broker_router_builds_broker_source_endpoint() {
+    fn broker_source_contains_bus_pattern_and_group() {
         let bus = FakeBus::new();
-        let router =
-            BrokerRouter::new(bus.clone()).bind("orders.created", "orders.in", handle_test_message);
-        let routes: Vec<_> = router.routes().collect();
+        let source = BrokerSource::new(bus, "orders.created", "orders.in");
 
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].pattern, "orders.created");
-        assert_eq!(routes[0].group, "orders.in");
-        assert_eq!(routes[0].reply_topic_prefix, None);
-        assert_eq!(router.bus().group_subscription_count(), 0);
+        assert_eq!(source.route().pattern, "orders.created");
+        assert_eq!(source.route().group, "orders.in");
+        assert_eq!(source.bus().group_subscription_count(), 0);
     }
 
     #[test]
-    fn broker_router_accepts_explicit_codec() {
+    fn neutral_router_owns_the_codec() {
         let bus = FakeBus::new();
-        let router = BrokerRouter::with_codec(bus, crate::codec::JsonCodec).bind(
-            "orders.created",
-            "orders.in",
-            handle_test_message,
-        );
+        let router = crate::router::Router::with_codec(crate::codec::JsonCodec)
+            .bind(handle_test_message)
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.created",
+                "orders.in",
+            ))
+            .to(BrokerTarget::new(bus, "orders.processed"));
 
         let _: &crate::codec::JsonCodec = router.codec();
         assert_eq!(router.route_count(), 1);
     }
 
     #[test]
-    fn broker_router_sets_reply_to_on_last_binding() {
+    fn broker_target_can_use_fixed_subject() {
         let bus = FakeBus::new();
-        let router = BrokerRouter::new(bus)
-            .bind("orders.created", "orders.in", handle_test_message)
-            .reply_to("orders.processed");
-        let routes: Vec<_> = router.routes().collect();
+        let target = BrokerTarget::new(bus, "orders.processed");
 
-        assert_eq!(routes[0].reply_to.as_deref(), Some("orders.processed"));
+        assert!(target.accepts(&route_message_from_broker(raw_message(
+            "orders.created",
+            bytes::Bytes::new(),
+            None,
+        ))));
     }
 
     #[test]
-    fn broker_router_sets_reply_topic_prefix_on_last_binding() {
+    fn broker_reply_target_requires_reply_header() {
         let bus = FakeBus::new();
-        let router = BrokerRouter::new(bus)
-            .bind("orders.created", "orders.in", handle_test_message)
-            .reply_to("orders.processed")
-            .reply_topic_prefix("_qanat.proxy.reply");
-        let routes: Vec<_> = router.routes().collect();
+        let target = BrokerTarget::reply_to(bus);
 
-        assert_eq!(
-            routes[0].reply_topic_prefix.as_deref(),
-            Some("_qanat.proxy.reply")
-        );
+        assert!(!target.accepts(&route_message_from_broker(raw_message(
+            "orders.created",
+            bytes::Bytes::new(),
+            None,
+        ))));
     }
 
     #[test]
@@ -1071,20 +906,22 @@ mod tests {
         let bus = LoopbackBus::default();
         let called = Arc::new(AtomicUsize::new(0));
         let called_by_handler = Arc::clone(&called);
-        let mut router = BrokerRouter::new(bus).bind(
-            "orders.process",
-            "orders.rpc",
-            move |message: TestMessage| {
+        let mut router = crate::router::Router::new()
+            .bind(move |message: TestMessage| {
                 let called = Arc::clone(&called_by_handler);
                 async move {
                     called.fetch_add(1, Ordering::Relaxed);
                     TestReply { id: message.id + 1 }
                 }
-            },
-        );
+            })
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.process",
+                "orders.rpc",
+            ))
+            .to(BrokerTarget::reply_to(bus.clone()));
         router.install().await.unwrap();
-        let proxy = router
-            .proxy(BrokerRoute::new("orders.process", "orders.rpc"))
+        let proxy = BrokerProxy::new(bus, BrokerRoute::new("orders.process", "orders.rpc"))
             .timeout(Duration::from_secs(1));
 
         let (first, second) = tokio::join!(
@@ -1129,90 +966,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broker_handler_decodes_message_and_calls_function() {
+    async fn neutral_router_decodes_broker_message_and_calls_function() {
+        let bus = LoopbackBus::default();
         let seen = Arc::new(AtomicUsize::new(0));
         let seen_by_handler = Arc::clone(&seen);
-        let router = BrokerRouter::new(FakeBus::new()).bind(
-            "orders.created",
-            "orders.in",
-            move |message: TestMessage| {
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let mut router = crate::router::Router::new()
+            .bind(move |message: TestMessage| {
                 let seen = Arc::clone(&seen_by_handler);
                 async move {
                     seen.fetch_add(message.id as usize, Ordering::Relaxed);
                 }
-            },
-        );
-        let payload = router
-            .codec()
-            .encode(&serde_json::json!({ "id": 42 }))
-            .unwrap();
-        let message = raw_message("orders.created", payload, None);
+            })
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.created",
+                "orders.in",
+            ))
+            .to(CaptureTarget { sender: output_tx });
+        router.install().await.unwrap();
 
-        let binding = &router.bindings[0];
-        binding
-            .handler
-            .call(message, &binding.route, router.codec())
+        bus.dispatch(
+            "orders.created",
+            raw_message(
+                "orders.created",
+                router.codec().encode(&TestMessage { id: 42 }).unwrap(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
             .await
+            .unwrap()
             .unwrap();
 
         assert_eq!(seen.load(Ordering::Relaxed), 42);
     }
 
     #[tokio::test]
-    async fn broker_handler_encodes_reply_when_reply_to_is_set() {
-        let router = BrokerRouter::new(FakeBus::new())
-            .bind(
+    async fn broker_target_dispatches_encoded_output_to_configured_reply() {
+        let bus = LoopbackBus::default();
+        let mut replies = bus.subscribe("orders.processed").await.unwrap();
+        let mut router = crate::router::Router::new()
+            .bind(|message: TestMessage| async move { TestReply { id: message.id + 1 } })
+            .from(BrokerSource::new(
+                bus.clone(),
                 "orders.created",
                 "orders.in",
-                |message: TestMessage| async move { TestReply { id: message.id + 1 } },
-            )
-            .reply_to("orders.processed");
-        let payload = router
-            .codec()
-            .encode(&serde_json::json!({ "id": 42 }))
-            .unwrap();
-        let message = raw_message("orders.created", payload, None);
-        let binding = &router.bindings[0];
+            ))
+            .to(BrokerTarget::new(bus.clone(), "orders.processed"));
+        router.install().await.unwrap();
 
-        let (subject, reply) = binding
-            .handler
-            .call(message, &binding.route, router.codec())
-            .await
-            .unwrap()
-            .unwrap();
+        bus.dispatch(
+            "orders.created",
+            raw_message(
+                "orders.created",
+                router.codec().encode(&TestMessage { id: 42 }).unwrap(),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let reply = replies.next().await.unwrap();
         let decoded: TestReply = router.codec().decode(&reply.payload).unwrap();
 
-        assert_eq!(subject, "orders.processed");
         assert_eq!(reply.envelope.subject, "orders.processed");
         assert_eq!(decoded.id, 43);
     }
 
     #[tokio::test]
     async fn broker_handler_preserves_correlation_id_in_dynamic_reply() {
-        let router = BrokerRouter::new(FakeBus::new()).bind(
-            "orders.created",
-            "orders.in",
-            |message: TestMessage| async move { TestReply { id: message.id + 1 } },
-        );
-        let payload = router.codec().encode(&TestMessage { id: 42 }).unwrap();
+        let bus = LoopbackBus::default();
+        let mut replies = bus.subscribe("instance.reply.7").await.unwrap();
+        let mut router = crate::router::Router::new()
+            .bind(|message: TestMessage| async move { TestReply { id: message.id + 1 } })
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.created",
+                "orders.in",
+            ))
+            .to(BrokerTarget::reply_to(bus.clone()));
+        router.install().await.unwrap();
         let message = raw_message(
             "orders.created",
-            payload,
+            router.codec().encode(&TestMessage { id: 42 }).unwrap(),
             Some(HashMap::from([
                 (CORRELATION_ID_HEADER.to_string(), "request-42".to_string()),
                 (REPLY_TO_HEADER.to_string(), "instance.reply.7".to_string()),
             ])),
         );
-        let binding = &router.bindings[0];
+        bus.dispatch("orders.created", message).await.unwrap();
+        let reply = replies.next().await.unwrap();
 
-        let (subject, reply) = binding
-            .handler
-            .call(message, &binding.route, router.codec())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(subject, "instance.reply.7");
+        assert_eq!(reply.envelope.subject, "instance.reply.7");
         assert_eq!(
             reply
                 .envelope
@@ -1233,73 +1080,130 @@ mod tests {
 
     #[tokio::test]
     async fn broker_handler_extracts_header_and_body_arguments() {
+        let bus = LoopbackBus::default();
         let (seen, mut seen_rx) = mpsc::channel::<(String, u64)>(1);
-        let router = BrokerRouter::new(FakeBus::new()).bind(
-            "orders.created",
-            "orders.in",
-            move |BrokerHeader(correlation): BrokerHeader<CorrelationId>, message: TestMessage| {
-                let seen = seen.clone();
-                async move {
-                    seen.send((correlation.0, message.id)).await.unwrap();
-                }
-            },
-        );
-        let payload = router
-            .codec()
-            .encode(&serde_json::json!({ "id": 42 }))
-            .unwrap();
+        let (output_tx, mut output_rx) = mpsc::channel(1);
+        let mut router = crate::router::Router::new()
+            .bind(
+                move |BrokerHeader(correlation): BrokerHeader<CorrelationId>,
+                      message: TestMessage| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.send((correlation.0, message.id)).await.unwrap();
+                    }
+                },
+            )
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.created",
+                "orders.in",
+            ))
+            .to(CaptureTarget { sender: output_tx });
+        router.install().await.unwrap();
         let message = raw_message(
             "orders.created",
-            payload,
+            router.codec().encode(&TestMessage { id: 42 }).unwrap(),
             Some(HashMap::from([(
                 "correlation_id".to_string(),
                 "request-1".to_string(),
             )])),
         );
-        let binding = &router.bindings[0];
-
-        binding
-            .handler
-            .call(message, &binding.route, router.codec())
-            .await
-            .unwrap();
+        bus.dispatch("orders.created", message).await.unwrap();
+        output_rx.recv().await.unwrap();
 
         assert_eq!(seen_rx.recv().await, Some(("request-1".to_string(), 42)));
     }
 
-    #[tokio::test]
-    async fn broker_handler_returns_error_when_required_header_is_missing() {
-        let router = BrokerRouter::new(FakeBus::new()).bind(
-            "orders.created",
-            "orders.in",
-            |_correlation: BrokerHeader<CorrelationId>| async {},
-        );
-        let payload = router
-            .codec()
-            .encode(&serde_json::json!({ "id": 42 }))
-            .unwrap();
-        let message = raw_message("orders.created", payload, None);
-        let binding = &router.bindings[0];
+    #[test]
+    fn broker_header_extractor_returns_error_when_required_header_is_missing() {
+        let message =
+            route_message_from_broker(raw_message("orders.created", bytes::Bytes::new(), None));
 
-        let err = binding
-            .handler
-            .call(message, &binding.route, router.codec())
-            .await
+        let err = BrokerHeader::<CorrelationId>::from_message(&message, &crate::codec::JsonCodec)
             .unwrap_err();
-
-        assert!(err.to_string().contains("message has no headers"));
+        assert!(
+            err.to_string()
+                .contains("missing broker header 'correlation_id'")
+        );
     }
 
     #[tokio::test]
-    async fn broker_router_installs_routes_into_bus() {
+    async fn neutral_router_installs_multiple_broker_sources() {
         let bus = FakeBus::new();
-        let mut router = BrokerRouter::new(bus.clone())
-            .bind("orders.created", "orders.in", handle_test_message)
-            .bind("payments.created", "payments.in", handle_test_message);
+        let mut router = crate::router::Router::new()
+            .bind(handle_test_message)
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.created",
+                "orders.in",
+            ))
+            .to(BrokerTarget::new(bus.clone(), "orders.processed"))
+            .bind(handle_test_message)
+            .from(BrokerSource::new(
+                bus.clone(),
+                "payments.created",
+                "payments.in",
+            ))
+            .to(BrokerTarget::new(bus.clone(), "payments.processed"));
 
         router.install().await.unwrap();
 
         assert_eq!(router.task_count(), 2);
         assert_eq!(bus.group_subscription_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn neutral_router_sends_broker_input_to_http_target() {
+        let bus = LoopbackBus::default();
+        let input_bus = bus.clone();
+        let (requests, mut request_rx) = mpsc::channel(1);
+        let target = HttpTarget::post("http://orders.test/events", move |request| {
+            let requests = requests.clone();
+            async move {
+                requests.send(request).await.unwrap();
+                Ok(crate::http::HttpResponse::new(202))
+            }
+        });
+        let mut router = crate::router::Router::new()
+            .bind(|message: TestMessage| async move { TestReply { id: message.id + 1 } })
+            .from(BrokerSource::new(bus, "orders.created", "orders.in"))
+            .to(target);
+        router.install().await.unwrap();
+
+        input_bus
+            .dispatch(
+                "orders.created",
+                raw_message(
+                    "orders.created",
+                    router.codec().encode(&TestMessage { id: 41 }).unwrap(),
+                    Some(HashMap::from([(
+                        CORRELATION_ID_HEADER.to_string(),
+                        "request-41".to_string(),
+                    )])),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let request = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("HTTP target was not invoked")
+            .expect("HTTP target channel closed");
+        let reply: TestReply = router.codec().decode(&request.body).unwrap();
+
+        assert_eq!(request.method, crate::http::HttpMethod::Post);
+        assert_eq!(request.url, "http://orders.test/events");
+        assert_eq!(reply.id, 42);
+        assert_eq!(
+            request
+                .headers
+                .get(CORRELATION_ID_HEADER)
+                .map(String::as_str),
+            Some("request-41")
+        );
+        assert_eq!(
+            request.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
     }
 }
