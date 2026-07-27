@@ -34,10 +34,51 @@ impl RouteMessage {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RouteHeaders(pub HashMap<String, String>);
+
+impl std::ops::Deref for RouteHeaders {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RouteHeaders {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<HashMap<String, String>> for RouteHeaders {
+    fn from(headers: HashMap<String, String>) -> Self {
+        Self(headers)
+    }
+}
+
+impl From<RouteHeaders> for HashMap<String, String> {
+    fn from(headers: RouteHeaders) -> Self {
+        headers.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteHeader<T>(pub T);
+
+pub trait FromRouteHeader: Sized {
+    const NAME: &'static str;
+
+    fn from_header(value: &str) -> Result<Self, BusError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutePayload(pub Bytes);
+
 pub type RouteStream = BoxStream<'static, RouteMessage>;
 
-pub trait RouteSource: Send + Sync + 'static {
-    fn subscribe(&self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>>;
+pub trait RouteSource: Send + 'static {
+    fn into_stream(self: Box<Self>) -> LocalBoxFuture<'static, Result<RouteStream, BusError>>;
 }
 
 pub trait RouteTarget: Send + Sync + 'static {
@@ -49,7 +90,7 @@ pub trait RouteTarget: Send + Sync + 'static {
 }
 
 struct RouteBinding<C: Codec> {
-    source: Arc<dyn RouteSource>,
+    source: Option<Box<dyn RouteSource>>,
     handler: Arc<dyn RouteHandler<C>>,
     target: Arc<dyn RouteTarget>,
 }
@@ -75,9 +116,9 @@ impl<C: Codec> Router<C> {
         }
     }
 
-    pub fn bind<H, Args>(self, handler: H) -> Bind<C, Args>
+    pub fn bind<H, Args, OutputMode>(self, handler: H) -> Bind<C, Args>
     where
-        H: IntoRouteHandler<C, Args>,
+        H: IntoRouteHandler<C, Args, OutputMode>,
         Args: Send + Sync + 'static,
     {
         Bind {
@@ -100,8 +141,12 @@ impl<C: Codec> Router<C> {
     }
 
     pub async fn install(&mut self) -> Result<(), BusError> {
-        for binding in &self.bindings {
-            let mut subscription = binding.source.subscribe().await?;
+        for binding in &mut self.bindings {
+            let source = binding
+                .source
+                .take()
+                .ok_or_else(|| BusError::Internal("route is already installed".into()))?;
+            let mut subscription = source.into_stream().await?;
             let handler = Arc::clone(&binding.handler);
             let target = Arc::clone(&binding.target);
             let codec = Arc::clone(&self.codec);
@@ -141,7 +186,7 @@ impl<C: Codec, Args> Bind<C, Args> {
         RouteFrom {
             router: self.router,
             handler: self.handler,
-            source: Arc::new(source),
+            source: Box::new(source),
             _args: PhantomData,
         }
     }
@@ -150,7 +195,7 @@ impl<C: Codec, Args> Bind<C, Args> {
 pub struct RouteFrom<C: Codec, Args> {
     router: Router<C>,
     handler: Arc<dyn RouteHandler<C>>,
-    source: Arc<dyn RouteSource>,
+    source: Box<dyn RouteSource>,
     _args: PhantomData<fn(Args)>,
 }
 
@@ -160,7 +205,7 @@ impl<C: Codec, Args> RouteFrom<C, Args> {
         T: RouteTarget,
     {
         self.router.bindings.push(RouteBinding {
-            source: self.source,
+            source: Some(self.source),
             handler: self.handler,
             target: Arc::new(target),
         });
@@ -176,13 +221,21 @@ pub trait RouteHandler<C: Codec>: Send + Sync {
     ) -> BoxFuture<'a, Result<RouteMessage, BusError>>;
 }
 
-pub trait IntoRouteHandler<C: Codec, Args>: Send + Sync + 'static {
+#[doc(hidden)]
+pub struct PreserveRouteHeaders;
+
+#[doc(hidden)]
+pub struct ReplaceRouteHeaders;
+
+pub trait IntoRouteHandler<C: Codec, Args, OutputMode = PreserveRouteHeaders>:
+    Send + Sync + 'static
+{
     fn into_handler(self) -> Arc<dyn RouteHandler<C>>;
 }
 
-pub struct TypedRouteHandler<Args, O, F> {
+pub struct TypedRouteHandler<Args, O, F, OutputMode = PreserveRouteHeaders> {
     handler: F,
-    _types: PhantomData<fn(Args) -> O>,
+    _types: PhantomData<fn(Args) -> (O, OutputMode)>,
 }
 
 fn encode_handler_output<O: Serialize>(
@@ -200,7 +253,7 @@ fn encode_handler_output<O: Serialize>(
     Ok(message)
 }
 
-impl<C, A, O, F, Fut> IntoRouteHandler<C, (A,)> for F
+impl<C, A, O, F, Fut> IntoRouteHandler<C, (A,), PreserveRouteHeaders> for F
 where
     C: Codec,
     A: FromRouteMessage<C> + Send + Sync + 'static,
@@ -211,12 +264,12 @@ where
     fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
         Arc::new(TypedRouteHandler {
             handler: self,
-            _types: PhantomData::<fn((A,)) -> O>,
+            _types: PhantomData::<fn((A,)) -> (O, PreserveRouteHeaders)>,
         })
     }
 }
 
-impl<C, A, B, O, F, Fut> IntoRouteHandler<C, (A, B)> for F
+impl<C, A, B, O, F, Fut> IntoRouteHandler<C, (A, B), PreserveRouteHeaders> for F
 where
     C: Codec,
     A: FromRouteMessage<C> + Send + Sync + 'static,
@@ -228,12 +281,12 @@ where
     fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
         Arc::new(TypedRouteHandler {
             handler: self,
-            _types: PhantomData::<fn((A, B)) -> O>,
+            _types: PhantomData::<fn((A, B)) -> (O, PreserveRouteHeaders)>,
         })
     }
 }
 
-impl<C, A, B, D, O, F, Fut> IntoRouteHandler<C, (A, B, D)> for F
+impl<C, A, B, D, O, F, Fut> IntoRouteHandler<C, (A, B, D), PreserveRouteHeaders> for F
 where
     C: Codec,
     A: FromRouteMessage<C> + Send + Sync + 'static,
@@ -246,12 +299,63 @@ where
     fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
         Arc::new(TypedRouteHandler {
             handler: self,
-            _types: PhantomData::<fn((A, B, D)) -> O>,
+            _types: PhantomData::<fn((A, B, D)) -> (O, PreserveRouteHeaders)>,
         })
     }
 }
 
-impl<A, O, F, Fut, C> RouteHandler<C> for TypedRouteHandler<(A,), O, F>
+impl<C, A, O, F, Fut> IntoRouteHandler<C, (A,), ReplaceRouteHeaders> for F
+where
+    C: Codec,
+    A: FromRouteMessage<C> + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
+    F: Fn(A) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = (RouteHeaders, O)> + Send + 'static,
+{
+    fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
+        Arc::new(TypedRouteHandler {
+            handler: self,
+            _types: PhantomData::<fn((A,)) -> (O, ReplaceRouteHeaders)>,
+        })
+    }
+}
+
+impl<C, A, B, O, F, Fut> IntoRouteHandler<C, (A, B), ReplaceRouteHeaders> for F
+where
+    C: Codec,
+    A: FromRouteMessage<C> + Send + Sync + 'static,
+    B: FromRouteMessage<C> + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
+    F: Fn(A, B) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = (RouteHeaders, O)> + Send + 'static,
+{
+    fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
+        Arc::new(TypedRouteHandler {
+            handler: self,
+            _types: PhantomData::<fn((A, B)) -> (O, ReplaceRouteHeaders)>,
+        })
+    }
+}
+
+impl<C, A, B, D, O, F, Fut> IntoRouteHandler<C, (A, B, D), ReplaceRouteHeaders> for F
+where
+    C: Codec,
+    A: FromRouteMessage<C> + Send + Sync + 'static,
+    B: FromRouteMessage<C> + Send + Sync + 'static,
+    D: FromRouteMessage<C> + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
+    F: Fn(A, B, D) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = (RouteHeaders, O)> + Send + 'static,
+{
+    fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
+        Arc::new(TypedRouteHandler {
+            handler: self,
+            _types: PhantomData::<fn((A, B, D)) -> (O, ReplaceRouteHeaders)>,
+        })
+    }
+}
+
+impl<A, O, F, Fut, C> RouteHandler<C> for TypedRouteHandler<(A,), O, F, PreserveRouteHeaders>
 where
     A: FromRouteMessage<C> + Send + Sync + 'static,
     O: Serialize + Send + Sync + 'static,
@@ -271,7 +375,7 @@ where
     }
 }
 
-impl<A, B, O, F, Fut, C> RouteHandler<C> for TypedRouteHandler<(A, B), O, F>
+impl<A, B, O, F, Fut, C> RouteHandler<C> for TypedRouteHandler<(A, B), O, F, PreserveRouteHeaders>
 where
     A: FromRouteMessage<C> + Send + Sync + 'static,
     B: FromRouteMessage<C> + Send + Sync + 'static,
@@ -296,7 +400,8 @@ where
     }
 }
 
-impl<A, B, D, O, F, Fut, C> RouteHandler<C> for TypedRouteHandler<(A, B, D), O, F>
+impl<A, B, D, O, F, Fut, C> RouteHandler<C>
+    for TypedRouteHandler<(A, B, D), O, F, PreserveRouteHeaders>
 where
     A: FromRouteMessage<C> + Send + Sync + 'static,
     B: FromRouteMessage<C> + Send + Sync + 'static,
@@ -323,6 +428,82 @@ where
     }
 }
 
+impl<A, O, F, Fut, C> RouteHandler<C> for TypedRouteHandler<(A,), O, F, ReplaceRouteHeaders>
+where
+    A: FromRouteMessage<C> + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
+    F: Fn(A) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = (RouteHeaders, O)> + Send + 'static,
+    C: Codec,
+{
+    fn call<'a>(
+        &'a self,
+        mut message: RouteMessage,
+        codec: &'a C,
+    ) -> BoxFuture<'a, Result<RouteMessage, BusError>> {
+        Box::pin(async move {
+            let (headers, output) = (self.handler)(A::from_message(&message, codec)?).await;
+            message.headers = headers.0;
+            encode_handler_output(&output, message, codec)
+        })
+    }
+}
+
+impl<A, B, O, F, Fut, C> RouteHandler<C> for TypedRouteHandler<(A, B), O, F, ReplaceRouteHeaders>
+where
+    A: FromRouteMessage<C> + Send + Sync + 'static,
+    B: FromRouteMessage<C> + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
+    F: Fn(A, B) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = (RouteHeaders, O)> + Send + 'static,
+    C: Codec,
+{
+    fn call<'a>(
+        &'a self,
+        mut message: RouteMessage,
+        codec: &'a C,
+    ) -> BoxFuture<'a, Result<RouteMessage, BusError>> {
+        Box::pin(async move {
+            let (headers, output) = (self.handler)(
+                A::from_message(&message, codec)?,
+                B::from_message(&message, codec)?,
+            )
+            .await;
+            message.headers = headers.0;
+            encode_handler_output(&output, message, codec)
+        })
+    }
+}
+
+impl<A, B, D, O, F, Fut, C> RouteHandler<C>
+    for TypedRouteHandler<(A, B, D), O, F, ReplaceRouteHeaders>
+where
+    A: FromRouteMessage<C> + Send + Sync + 'static,
+    B: FromRouteMessage<C> + Send + Sync + 'static,
+    D: FromRouteMessage<C> + Send + Sync + 'static,
+    O: Serialize + Send + Sync + 'static,
+    F: Fn(A, B, D) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = (RouteHeaders, O)> + Send + 'static,
+    C: Codec,
+{
+    fn call<'a>(
+        &'a self,
+        mut message: RouteMessage,
+        codec: &'a C,
+    ) -> BoxFuture<'a, Result<RouteMessage, BusError>> {
+        Box::pin(async move {
+            let (headers, output) = (self.handler)(
+                A::from_message(&message, codec)?,
+                B::from_message(&message, codec)?,
+                D::from_message(&message, codec)?,
+            )
+            .await;
+            message.headers = headers.0;
+            encode_handler_output(&output, message, codec)
+        })
+    }
+}
+
 pub trait FromRouteMessage<C: Codec>: Sized {
     fn from_message(message: &RouteMessage, codec: &C) -> Result<Self, BusError>;
 }
@@ -334,6 +515,38 @@ where
 {
     fn from_message(message: &RouteMessage, codec: &C) -> Result<Self, BusError> {
         codec.decode(&message.payload)
+    }
+}
+
+impl<C: Codec> FromRouteMessage<C> for RouteMessage {
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        Ok(message.clone())
+    }
+}
+
+impl<C: Codec> FromRouteMessage<C> for RouteHeaders {
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        Ok(Self(message.headers.clone()))
+    }
+}
+
+impl<T, C> FromRouteMessage<C> for RouteHeader<T>
+where
+    T: FromRouteHeader,
+    C: Codec,
+{
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        let value = message
+            .headers
+            .get(T::NAME)
+            .ok_or_else(|| BusError::Internal(format!("missing route header '{}'", T::NAME)))?;
+        Ok(Self(T::from_header(value)?))
+    }
+}
+
+impl<C: Codec> FromRouteMessage<C> for RoutePayload {
+    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        Ok(Self(message.payload.clone()))
     }
 }
 
@@ -349,8 +562,8 @@ mod tests {
     }
 
     impl RouteSource for CustomSource {
-        fn subscribe(&self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>> {
-            let message = self.message.clone();
+        fn into_stream(self: Box<Self>) -> LocalBoxFuture<'static, Result<RouteStream, BusError>> {
+            let message = self.message;
             Box::pin(
                 async move { Ok(Box::pin(stream::once(async move { message })) as RouteStream) },
             )
@@ -382,21 +595,53 @@ mod tests {
         value: u64,
     }
 
-    async fn double(input: Input) -> Output {
+    struct RequestId(String);
+
+    impl FromRouteHeader for RequestId {
+        const NAME: &'static str = "x-request-id";
+
+        fn from_header(value: &str) -> Result<Self, BusError> {
+            Ok(Self(value.to_string()))
+        }
+    }
+
+    async fn double(
+        RouteHeader(request_id): RouteHeader<RequestId>,
+        RoutePayload(raw_payload): RoutePayload,
+        input: Input,
+    ) -> Output {
+        assert_eq!(request_id.0, "request-21");
+        assert!(!raw_payload.is_empty());
         Output {
             value: input.value * 2,
         }
     }
 
+    async fn double_with_modified_headers(
+        mut headers: RouteHeaders,
+        input: Input,
+    ) -> (RouteHeaders, Output) {
+        headers.remove("x-remove");
+        headers.insert("x-processed-by".into(), "custom-handler".into());
+        (
+            headers,
+            Output {
+                value: input.value * 2,
+            },
+        )
+    }
+
     #[tokio::test]
     async fn user_defined_source_and_target_work_without_transport_types() {
         let codec = JsonCodec;
-        let source = CustomSource {
-            message: RouteMessage::new(
-                "custom://input",
-                codec.encode(&serde_json::json!({ "value": 21 })).unwrap(),
-            ),
-        };
+        let mut message = RouteMessage::new(
+            "custom://input",
+            codec.encode(&serde_json::json!({ "value": 21 })).unwrap(),
+        );
+        message
+            .headers
+            .insert("x-request-id".to_string(), "request-21".to_string());
+        let source = CustomSource { message };
         let (outputs, mut output_rx) = mpsc::channel(1);
         let mut router = Router::new()
             .bind(double)
@@ -412,6 +657,47 @@ mod tests {
         let decoded: Output = codec.decode(&output.payload).unwrap();
         assert_eq!(decoded.value, 42);
         assert_eq!(output.address, "custom://input");
+        assert_eq!(
+            output.headers.get("x-request-id").map(String::as_str),
+            Some("request-21")
+        );
+        assert_eq!(
+            output.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_can_optionally_replace_modified_headers() {
+        let codec = JsonCodec;
+        let mut message = RouteMessage::new(
+            "custom://input",
+            codec.encode(&serde_json::json!({ "value": 21 })).unwrap(),
+        );
+        message
+            .headers
+            .insert("x-request-id".to_string(), "request-21".to_string());
+        message
+            .headers
+            .insert("x-remove".to_string(), "private".to_string());
+        let (outputs, mut output_rx) = mpsc::channel(1);
+        let mut router = Router::new()
+            .bind(double_with_modified_headers)
+            .from(CustomSource { message })
+            .to(CustomTarget { outputs });
+
+        router.install().await.unwrap();
+
+        let output = output_rx.recv().await.unwrap();
+        assert_eq!(
+            output.headers.get("x-request-id").map(String::as_str),
+            Some("request-21")
+        );
+        assert_eq!(
+            output.headers.get("x-processed-by").map(String::as_str),
+            Some("custom-handler")
+        );
+        assert!(!output.headers.contains_key("x-remove"));
         assert_eq!(
             output.headers.get("content-type").map(String::as_str),
             Some("application/json")

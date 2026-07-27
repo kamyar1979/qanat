@@ -8,7 +8,10 @@ use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
-use crate::router::core::{FromRouteMessage, RouteMessage, RouteSource, RouteStream, RouteTarget};
+use crate::router::core::{
+    FromRouteMessage, RouteHeader, RouteHeaders, RouteMessage, RouteSource, RouteStream,
+    RouteTarget,
+};
 use futures::StreamExt;
 use futures::future::{BoxFuture, LocalBoxFuture};
 use serde::{Serialize, de::DeserializeOwned};
@@ -110,7 +113,7 @@ impl<B> RouteSource for BrokerSource<B>
 where
     B: Bus<Message = RawMessage> + 'static,
 {
-    fn subscribe(&self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>> {
+    fn into_stream(self: Box<Self>) -> LocalBoxFuture<'static, Result<RouteStream, BusError>> {
         Box::pin(async move {
             let stream = self
                 .bus
@@ -192,37 +195,9 @@ impl<C: Codec> FromRouteMessage<C> for BrokerEnvelope {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BrokerHeaders(pub std::collections::HashMap<String, String>);
-
-impl<C: Codec> FromRouteMessage<C> for BrokerHeaders {
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
-        Ok(Self(message.headers.clone()))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct BrokerHeader<T>(pub T);
-
-pub trait FromBrokerHeader: Sized {
-    const NAME: &'static str;
-
-    fn from_header(value: &str) -> Result<Self, BusError>;
-}
-
-impl<T, C> FromRouteMessage<C> for BrokerHeader<T>
-where
-    T: FromBrokerHeader,
-    C: Codec,
-{
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
-        let value = message
-            .headers
-            .get(T::NAME)
-            .ok_or_else(|| BusError::Internal(format!("missing broker header '{}'", T::NAME)))?;
-        Ok(Self(T::from_header(value)?))
-    }
-}
+pub type BrokerHeaders = RouteHeaders;
+pub type BrokerHeader<T> = RouteHeader<T>;
+pub use crate::router::core::FromRouteHeader as FromBrokerHeader;
 
 #[derive(Clone, Debug)]
 pub struct BrokerRawMessage(pub RawMessage);
@@ -734,7 +709,7 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct CorrelationId(String);
 
-    impl FromBrokerHeader for CorrelationId {
+    impl crate::router::FromRouteHeader for CorrelationId {
         const NAME: &'static str = "correlation_id";
 
         fn from_header(value: &str) -> Result<Self, BusError> {
@@ -1085,7 +1060,7 @@ mod tests {
         let (output_tx, mut output_rx) = mpsc::channel(1);
         let mut router = crate::router::Router::new()
             .bind(
-                move |BrokerHeader(correlation): BrokerHeader<CorrelationId>,
+                move |RouteHeader(correlation): RouteHeader<CorrelationId>,
                       message: TestMessage| {
                     let seen = seen.clone();
                     async move {
@@ -1115,15 +1090,15 @@ mod tests {
     }
 
     #[test]
-    fn broker_header_extractor_returns_error_when_required_header_is_missing() {
+    fn route_header_extractor_returns_error_when_required_header_is_missing() {
         let message =
             route_message_from_broker(raw_message("orders.created", bytes::Bytes::new(), None));
 
-        let err = BrokerHeader::<CorrelationId>::from_message(&message, &crate::codec::JsonCodec)
+        let err = RouteHeader::<CorrelationId>::from_message(&message, &crate::codec::JsonCodec)
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains("missing broker header 'correlation_id'")
+                .contains("missing route header 'correlation_id'")
         );
     }
 
@@ -1165,7 +1140,13 @@ mod tests {
             }
         });
         let mut router = crate::router::Router::new()
-            .bind(|message: TestMessage| async move { TestReply { id: message.id + 1 } })
+            .bind(
+                |mut headers: crate::router::RouteHeaders, message: TestMessage| async move {
+                    headers.remove("x-internal");
+                    headers.insert("x-processed-by".into(), "orders-service".into());
+                    (headers, TestReply { id: message.id + 1 })
+                },
+            )
             .from(BrokerSource::new(bus, "orders.created", "orders.in"))
             .to(target);
         router.install().await.unwrap();
@@ -1176,10 +1157,10 @@ mod tests {
                 raw_message(
                     "orders.created",
                     router.codec().encode(&TestMessage { id: 41 }).unwrap(),
-                    Some(HashMap::from([(
-                        CORRELATION_ID_HEADER.to_string(),
-                        "request-41".to_string(),
-                    )])),
+                    Some(HashMap::from([
+                        (CORRELATION_ID_HEADER.to_string(), "request-41".to_string()),
+                        ("x-internal".to_string(), "secret".to_string()),
+                    ])),
                 ),
             )
             .await
@@ -1205,5 +1186,10 @@ mod tests {
             request.headers.get("content-type").map(String::as_str),
             Some("application/json")
         );
+        assert_eq!(
+            request.headers.get("x-processed-by").map(String::as_str),
+            Some("orders-service")
+        );
+        assert!(!request.headers.contains_key("x-internal"));
     }
 }

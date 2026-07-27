@@ -160,6 +160,30 @@ Handlers can extract the decoded body, complete broker envelope, all headers,
 individual typed headers, or the raw broker message. The router codec is used
 for both decoding handler input and encoding handler output.
 
+Header and payload extraction is transport-neutral:
+
+```rust,ignore
+use qanat::router::{RouteHeader, RouteHeaders, RoutePayload};
+
+async fn handle(
+    RouteHeader(request_id): RouteHeader<RequestId>,
+    mut headers: RouteHeaders,
+    RoutePayload(raw_payload): RoutePayload,
+    input: ProcessOrder,
+) -> (RouteHeaders, OrderProcessed) {
+    headers.insert("x-processed-by".into(), "orders-service".into());
+    headers.remove("x-internal-token");
+
+    (headers, OrderProcessed { id: input.id })
+}
+```
+
+Every `RouteSource` produces a `RouteMessage` containing `headers` and
+`payload`; every `RouteTarget` receives the same fields after handler
+processing. A plain handler return value preserves incoming headers
+automatically. Returning `(RouteHeaders, output)` replaces them with the
+returned, potentially modified headers.
+
 ### Broker Input to HTTP Output
 
 Use `.to(HttpTarget)` to deliver a broker handler's encoded return value to an
@@ -215,6 +239,31 @@ async fn main() -> Result<(), qanat::errors::BusError> {
 `HttpTarget` also accepts an async closure or a custom `HttpInvoker`
 implementation, allowing an existing HTTP client to be adapted without
 enabling `http-client`.
+
+### HTTP Input to Broker Output
+
+With the `axum` feature, mount an `HttpSource` into `HttpRouter`, then move that
+source into the neutral router. The HTTP request method, URI, headers, and body
+become a `RouteMessage`; accepted requests receive HTTP `202`.
+
+```rust,ignore
+use qanat::router::{BrokerTarget, HttpRouter, HttpSource, Router};
+
+let source = HttpSource::post("/orders");
+let http = HttpRouter::new()
+    .source(&source)
+    .into_router();
+
+let mut routes = Router::new()
+    .bind(process_order)
+    .from(source)
+    .to(BrokerTarget::new(bus, "orders.processed"));
+
+routes.install().await?;
+```
+
+`RouteSource` and `RouteTarget` are public traits. Additional transports such as
+gRPC or WebSocket can integrate without changing `Router`.
 
 ## Request/Reply Proxy
 

@@ -17,8 +17,9 @@ pub use config::{
     RouteManifest,
 };
 pub use core::{
-    Bind, FromRouteMessage, IntoRouteHandler, RouteFrom, RouteHandler, RouteMessage, RouteSource,
-    RouteStream, RouteTarget, Router, TypedRouteHandler,
+    Bind, FromRouteHeader, FromRouteMessage, IntoRouteHandler, RouteFrom, RouteHandler,
+    RouteHeader, RouteHeaders, RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget,
+    Router, TypedRouteHandler,
 };
 #[cfg(feature = "axum")]
-pub use http::HttpRouter;
+pub use http::{DEFAULT_HTTP_BODY_LIMIT, DEFAULT_HTTP_SOURCE_CAPACITY, HttpRouter, HttpSource};
