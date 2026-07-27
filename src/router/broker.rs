@@ -8,15 +8,13 @@ use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
-use crate::router::core::{
-    FromRouteMessage, RouteHeader, RouteHeaders, RouteMessage, RouteSource, RouteStream,
-    RouteTarget,
-};
+use crate::router::core::{FromRouteMessage, RouteHeader, RouteHeaders, RouteMessage};
 use futures::StreamExt;
-use futures::future::{BoxFuture, LocalBoxFuture};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OnceCell, mpsc, oneshot};
 use uuid::Uuid;
+
+pub use crate::bus::{BrokerSource, BrokerTarget};
 
 pub const DEFAULT_REDELIVERY_MESSAGE_DELAY: Duration = Duration::from_secs(5);
 pub const DEFAULT_MESSAGE_RETRIES: usize = 3;
@@ -76,66 +74,19 @@ impl BrokerRoute {
     }
 }
 
-pub struct BrokerSource<B: Bus> {
-    bus: Arc<B>,
-    route: BrokerRoute,
-}
-
-impl<B: Bus> BrokerSource<B> {
-    pub fn new(bus: B, pattern: impl Into<String>, group: impl Into<String>) -> Self {
-        Self {
-            bus: Arc::new(bus),
-            route: BrokerRoute::new(pattern, group),
-        }
-    }
-
-    pub fn from_shared(bus: Arc<B>, pattern: impl Into<String>, group: impl Into<String>) -> Self {
-        Self {
-            bus,
-            route: BrokerRoute::new(pattern, group),
-        }
-    }
-
-    pub fn bus(&self) -> &B {
-        self.bus.as_ref()
-    }
-
-    pub fn route(&self) -> &BrokerRoute {
-        &self.route
-    }
-
-    pub fn shared_bus(&self) -> Arc<B> {
-        Arc::clone(&self.bus)
-    }
-}
-
-impl<B> RouteSource for BrokerSource<B>
-where
-    B: Bus<Message = RawMessage> + 'static,
-{
-    fn into_stream(self: Box<Self>) -> LocalBoxFuture<'static, Result<RouteStream, BusError>> {
-        Box::pin(async move {
-            let stream = self
-                .bus
-                .subscribe_group(&self.route.pattern, &self.route.group)
-                .await?;
-            Ok(Box::pin(stream.map(route_message_from_broker)) as RouteStream)
-        })
-    }
-}
-
-fn route_message_from_broker(message: RawMessage) -> RouteMessage {
+pub(crate) fn route_message_from_broker(message: RawMessage) -> RouteMessage {
     RouteMessage {
         address: message.envelope.subject,
         timestamp: message.envelope.timestamp,
         id: message.envelope.id,
         headers: message.envelope.headers.unwrap_or_default(),
+        metadata: HashMap::new(),
         attempts: message.envelope.attempts,
         payload: message.payload,
     }
 }
 
-fn broker_message_from_route(message: RouteMessage) -> RawMessage {
+pub(crate) fn broker_message_from_route(message: RouteMessage) -> RawMessage {
     RawMessage {
         envelope: Envelope {
             subject: message.address,
@@ -145,44 +96,6 @@ fn broker_message_from_route(message: RouteMessage) -> RawMessage {
             attempts: message.attempts,
         },
         payload: message.payload,
-    }
-}
-
-enum BrokerDestination {
-    Subject(String),
-    ReplyTo,
-}
-
-pub struct BrokerTarget<B: Bus> {
-    bus: Arc<B>,
-    destination: BrokerDestination,
-}
-
-impl<B: Bus> BrokerTarget<B> {
-    pub fn new(bus: B, subject: impl Into<String>) -> Self {
-        Self::from_shared(Arc::new(bus), subject)
-    }
-
-    pub fn from_shared(bus: Arc<B>, subject: impl Into<String>) -> Self {
-        Self {
-            bus,
-            destination: BrokerDestination::Subject(subject.into()),
-        }
-    }
-
-    pub fn reply_to(bus: B) -> Self {
-        Self::reply_to_shared(Arc::new(bus))
-    }
-
-    pub fn reply_to_shared(bus: Arc<B>) -> Self {
-        Self {
-            bus,
-            destination: BrokerDestination::ReplyTo,
-        }
-    }
-
-    pub fn bus(&self) -> &B {
-        self.bus.as_ref()
     }
 }
 
@@ -205,38 +118,6 @@ pub struct BrokerRawMessage(pub RawMessage);
 impl<C: Codec> FromRouteMessage<C> for BrokerRawMessage {
     fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
         Ok(Self(broker_message_from_route(message.clone())))
-    }
-}
-
-impl<B> RouteTarget for BrokerTarget<B>
-where
-    B: Bus<Message = RawMessage> + 'static,
-{
-    fn accepts(&self, message: &RouteMessage) -> bool {
-        match self.destination {
-            BrokerDestination::Subject(_) => true,
-            BrokerDestination::ReplyTo => message.headers.contains_key(REPLY_TO_HEADER),
-        }
-    }
-
-    fn deliver(&self, mut output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
-        Box::pin(async move {
-            let subject = match &self.destination {
-                BrokerDestination::Subject(subject) => subject.clone(),
-                BrokerDestination::ReplyTo => output
-                    .headers
-                    .get(REPLY_TO_HEADER)
-                    .cloned()
-                    .ok_or_else(|| {
-                        BusError::Internal("broker reply target requires a reply_to header".into())
-                    })?,
-            };
-            output.headers.remove(REPLY_TO_HEADER);
-            output.address = subject.clone();
-            self.bus
-                .dispatch(&subject, broker_message_from_route(output))
-                .await
-        })
     }
 }
 
@@ -538,6 +419,8 @@ mod tests {
     use crate::codec::Codec;
     use crate::http::HttpTarget;
     use crate::message::Envelope;
+    use crate::router::RouteTarget;
+    use futures::future::BoxFuture;
     use futures::stream;
     use std::collections::HashMap;
     use std::future::Future;

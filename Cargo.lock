@@ -1653,6 +1653,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "tokio",
  "tokio-stream",
  "toml",

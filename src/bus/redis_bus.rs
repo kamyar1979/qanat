@@ -144,6 +144,9 @@ mod tests {
     async fn try_bus() -> Option<RedisBus<JsonCodec>> {
         match RedisBus::connect_with_channel(JsonCodec, REDIS_URL, &redis_channel()).await {
             Ok(bus) => Some(bus),
+            Err(error) if std::env::var_os("QANAT_REQUIRE_BROKERS").is_some() => {
+                panic!("Redis is required at {REDIS_URL}, but connection failed: {error}")
+            }
             Err(_) => {
                 eprintln!("skipping: Redis not available at {REDIS_URL}");
                 None

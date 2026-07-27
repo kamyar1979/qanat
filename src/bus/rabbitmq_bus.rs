@@ -315,6 +315,9 @@ mod tests {
         let exchange = unique_name("exchange");
         match RabbitMqBus::connect(JsonCodec, RABBITMQ_URL, &exchange).await {
             Ok(bus) => Some(bus),
+            Err(error) if std::env::var_os("QANAT_REQUIRE_BROKERS").is_some() => {
+                panic!("RabbitMQ is required at {RABBITMQ_URL}, but connection failed: {error}")
+            }
             Err(_) => {
                 eprintln!("skipping: RabbitMQ not available at {RABBITMQ_URL}");
                 None

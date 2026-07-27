@@ -2,9 +2,9 @@ use std::marker::PhantomData;
 
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
-use crate::router::core::Router;
 #[cfg(feature = "axum")]
-use crate::router::http::HttpRouter;
+use crate::http::HttpRouter;
+use crate::router::core::Router;
 
 pub struct App<C: Codec = JsonCodec> {
     routes: Option<Router<C>>,

@@ -1,8 +1,10 @@
-mod target;
+pub mod adapter;
 
 #[cfg(feature = "http-client")]
-pub use target::ReqwestHttpInvoker;
-pub use target::{HttpInvoker, HttpMethod, HttpRequest, HttpResponse, HttpTarget};
-
+pub use adapter::ReqwestHttpInvoker;
 #[cfg(feature = "axum")]
-pub use crate::router::{HttpRouter, HttpSource};
+pub use adapter::{
+    DEFAULT_HTTP_BODY_LIMIT, DEFAULT_HTTP_SOURCE_CAPACITY, HttpPath, HttpQuery, HttpRouter,
+    HttpSource,
+};
+pub use adapter::{HttpInvoker, HttpMethod, HttpRequest, HttpResponse, HttpTarget};

@@ -185,6 +185,9 @@ mod tests {
     async fn try_bus() -> Option<NatsBus<JsonCodec>> {
         match NatsBus::connect(JsonCodec, NATS_URL).await {
             Ok(bus) => Some(bus),
+            Err(error) if std::env::var_os("QANAT_REQUIRE_BROKERS").is_some() => {
+                panic!("NATS is required at {NATS_URL}, but connection failed: {error}")
+            }
             Err(_) => {
                 eprintln!("skipping: NATS not available at {NATS_URL}");
                 None

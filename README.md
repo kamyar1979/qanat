@@ -21,6 +21,18 @@ The crates.io package is named `qanat-routing`; the Rust library name remains
 - Axum routing without an extra HTTP abstraction layer
 - Optional dependencies for every external backend and non-JSON codec
 
+The neutral router supports every built-in source/target pairing:
+
+| Source | Target | Supported |
+| --- | --- | --- |
+| Broker | Broker | Yes |
+| Broker | HTTP | Yes |
+| HTTP | Broker | Yes |
+| HTTP | HTTP | Yes |
+
+Headers pass through each route by default. A handler can return modified
+headers when a route needs to add, replace, or remove them.
+
 ## Installation
 
 The default build includes the in-memory bus and JSON codec without any
@@ -156,6 +168,10 @@ async fn main() -> Result<(), qanat::errors::BusError> {
 }
 ```
 
+Use `Router::with_codec(CborCodec)` or `Router::with_codec(MsgPackCodec)` when
+the corresponding feature is enabled. One router uses one codec for all of its
+bindings.
+
 Handlers can extract the decoded body, complete broker envelope, all headers,
 individual typed headers, or the raw broker message. The router codec is used
 for both decoding handler input and encoding handler output.
@@ -247,9 +263,47 @@ source into the neutral router. The HTTP request method, URI, headers, and body
 become a `RouteMessage`; accepted requests receive HTTP `202`.
 
 ```rust,ignore
-use qanat::router::{BrokerTarget, HttpRouter, HttpSource, Router};
+use serde::{Deserialize, Serialize};
 
-let source = HttpSource::post("/orders");
+use qanat::router::{
+    BrokerTarget, HttpPath, HttpQuery, HttpRouter, HttpSource, Router,
+};
+
+#[derive(Deserialize)]
+struct OrderPath {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct OrderQuery {
+    include_events: bool,
+}
+
+#[derive(Deserialize)]
+struct ProcessOrder {
+    sku: String,
+}
+
+#[derive(Serialize)]
+struct OrderProcessed {
+    id: u64,
+    sku: String,
+    include_events: bool,
+}
+
+async fn process_order(
+    HttpPath(path): HttpPath<OrderPath>,
+    HttpQuery(query): HttpQuery<OrderQuery>,
+    order: ProcessOrder,
+) -> OrderProcessed {
+    OrderProcessed {
+        id: path.id,
+        sku: order.sku,
+        include_events: query.include_events,
+    }
+}
+
+let source = HttpSource::post("/orders/{id}");
 let http = HttpRouter::new()
     .source(&source)
     .into_router();
@@ -261,6 +315,12 @@ let mut routes = Router::new()
 
 routes.install().await?;
 ```
+
+`HttpPath<T>` decodes named path parameters into `T`. `HttpQuery<T>` decodes
+the query string. HTTP-specific values are captured as namespaced route
+metadata, so the core router and user-defined transports remain independent of
+Axum. `HttpSource` rejects bodies over its configured limit with HTTP `413`
+and returns HTTP `503` when its route receiver is no longer available.
 
 `RouteSource` and `RouteTarget` are public traits. Additional transports such as
 gRPC or WebSocket can integrate without changing `Router`.
@@ -329,6 +389,10 @@ Use `call_with_headers` to attach application headers. Use `.reply_to(...)` for
 a fixed reply subject or `.reply_topic_prefix(...)` to replace the default
 instance-specific prefix.
 
+`BrokerProxy::new` uses JSON. To use another format, construct it with
+`BrokerProxy::with_codec` and use the same codec as the route serving the
+request.
+
 ## HTTP Routing
 
 With the `axum` feature, `HttpRouter` accepts native Axum handlers and
@@ -364,7 +428,7 @@ the wire frame and use Qanat's local router after receipt.
 
 | Feature | Adds |
 | --- | --- |
-| `axum` | Axum `HttpRouter` |
+| `axum` | Axum `HttpRouter`, `HttpSource`, `HttpPath`, and `HttpQuery` |
 | `http-client` | Reqwest-backed outbound `HttpTarget` invoker |
 | `nats` | NATS backend |
 | `nng` | NNG Bus0 backend |
@@ -374,6 +438,35 @@ the wire frame and use Qanat's local router after receipt.
 | `msgpack` | `MsgPackCodec` |
 
 Features are independent and disabled by default.
+
+## Testing
+
+Run the broker-free, default-feature suite first:
+
+```console
+cargo test --locked --no-default-features
+```
+
+Run every feature and backend integration:
+
+```console
+cargo test --locked --all-features -- --test-threads=1
+```
+
+NATS, RabbitMQ, and Redis tests probe their standard local ports and return
+early when a service is unavailable. The release workflow starts all three
+services and sets `QANAT_REQUIRE_BROKERS=1`, so a failed broker connection
+cannot be silently skipped during release verification. Set the same variable
+to require all local broker integrations. NNG integration tests use its
+in-process transport and require no service.
+
+Before publishing, also run:
+
+```console
+cargo fmt --check
+cargo clippy --locked --all-features --all-targets -- -D warnings
+cargo package --locked
+```
 
 ## License
 

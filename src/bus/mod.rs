@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+pub mod adapter;
 pub mod codec;
 pub mod in_memory_bus;
 pub(crate) mod internal_router;
@@ -29,6 +30,8 @@ pub mod redis_bus;
 pub(crate) mod routing;
 #[cfg(any(feature = "nng", feature = "redis"))]
 pub(crate) mod wire;
+
+pub use adapter::{BrokerSource, BrokerTarget};
 
 /// Channel-backed stream used by local-routed buses.
 pub struct BusStream<M: Clone + Send + 'static> {

@@ -2,9 +2,12 @@ pub mod app;
 pub mod broker;
 pub mod config;
 pub mod core;
-#[cfg(feature = "axum")]
-pub mod http;
 
+#[cfg(feature = "axum")]
+pub use crate::http::{
+    DEFAULT_HTTP_BODY_LIMIT, DEFAULT_HTTP_SOURCE_CAPACITY, HttpPath, HttpQuery, HttpRouter,
+    HttpSource,
+};
 pub use app::App;
 pub use broker::{
     BrokerConfiguration, BrokerEnvelope, BrokerHeader, BrokerHeaders, BrokerProxy,
@@ -21,5 +24,3 @@ pub use core::{
     RouteHeader, RouteHeaders, RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget,
     Router, TypedRouteHandler,
 };
-#[cfg(feature = "axum")]
-pub use http::{DEFAULT_HTTP_BODY_LIMIT, DEFAULT_HTTP_SOURCE_CAPACITY, HttpRouter, HttpSource};

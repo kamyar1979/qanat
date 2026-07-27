@@ -14,6 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  QANAT_REQUIRE_BROKERS: "1"
 
 jobs:
   verify:
