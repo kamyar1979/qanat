@@ -787,10 +787,7 @@ mod target_impl {
     }
 
     pub trait HttpInvoker: Send + Sync + 'static {
-        fn invoke<'a>(
-            &'a self,
-            request: HttpRequest,
-        ) -> BoxFuture<'a, Result<HttpResponse, BusError>>;
+        fn invoke(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, BusError>>;
     }
 
     impl<F, Fut> HttpInvoker for F
@@ -798,10 +795,7 @@ mod target_impl {
         F: Fn(HttpRequest) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<HttpResponse, BusError>> + Send + 'static,
     {
-        fn invoke<'a>(
-            &'a self,
-            request: HttpRequest,
-        ) -> BoxFuture<'a, Result<HttpResponse, BusError>> {
+        fn invoke(&self, request: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, BusError>> {
             Box::pin((self)(request))
         }
     }

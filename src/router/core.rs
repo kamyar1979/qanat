@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
+
+pub const ROUTE_FAILURE_HEADER: &str = "qanat-route-failure";
+
 #[derive(Clone, Debug)]
 pub struct RouteMessage {
     pub address: String,
@@ -350,6 +353,7 @@ fn encode_handler_output<O: Serialize>(
     mut message: RouteMessage,
     codec: &impl Codec,
 ) -> Result<RouteMessage, RouteError> {
+    message.headers.remove(ROUTE_FAILURE_HEADER);
     message
         .headers
         .entry("content-type".to_string())
@@ -382,6 +386,9 @@ async fn deliver_failure<C: Codec>(
     message
         .headers
         .insert("content-type".to_string(), codec.content_type().to_string());
+    message
+        .headers
+        .insert(ROUTE_FAILURE_HEADER.to_string(), "true".to_string());
 
     if target.accepts(&message) {
         let _ = target.deliver(message).await;

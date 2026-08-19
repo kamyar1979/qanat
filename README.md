@@ -40,7 +40,7 @@ external broker dependency:
 
 ```toml
 [dependencies]
-qanat-routing = "0.1.0"
+qanat-routing = "0.2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures = "0.3"
 ```
@@ -49,7 +49,7 @@ Enable only the integrations required by the application:
 
 ```toml
 [dependencies]
-qanat-routing = { version = "0.1.0", features = ["nats", "axum", "http-client"] }
+qanat-routing = { version = "0.2.0", features = ["nats", "axum", "http-client"] }
 ```
 
 ## In-Memory Bus
@@ -375,7 +375,7 @@ use std::time::Duration;
 use qanat::{
     codec::JsonCodec,
     nats_bus::NatsBus,
-    router::{BrokerProxy, BrokerRoute, BrokerSource, BrokerTarget, Router},
+    router::{BrokerProxy, BrokerRoute, BrokerSource, BrokerTarget, ProxyError, Router},
 };
 use serde::{Deserialize, Serialize};
 
@@ -400,6 +400,7 @@ async fn main() -> Result<(), qanat::errors::BusError> {
     let bus = NatsBus::connect(JsonCodec, "nats://localhost:4222").await?;
     let mut router = Router::new()
         .bind(process_order)
+        .errors_to(BrokerTarget::reply_to(bus.clone()))
         .from(BrokerSource::new(
             bus.clone(),
             "orders.process",
@@ -414,7 +415,14 @@ async fn main() -> Result<(), qanat::errors::BusError> {
 
     router.install().await?;
 
-    let response: OrderProcessed = proxy.call(&ProcessOrder { id: 42 }).await?;
+    let response: OrderProcessed = match proxy.call(&ProcessOrder { id: 42 }).await {
+        Ok(response) => response,
+        Err(ProxyError::Remote(failure)) => {
+            eprintln!("remote handler failed: {}", failure.error);
+            return Ok(());
+        }
+        Err(error) => return Err(qanat::errors::BusError::Internal(error.to_string())),
+    };
     assert_eq!(response.id, 42);
     Ok(())
 }
@@ -432,6 +440,23 @@ instance-specific prefix.
 `BrokerProxy::new` uses JSON. To use another format, construct it with
 `BrokerProxy::with_codec` and use the same codec as the route serving the
 request.
+
+`BrokerProxy::call` follows Rust's `Result` model and returns `ProxyError`:
+
+- `ProxyError::Remote` contains the callee's structured `RouteFailure`.
+- `ProxyError::Timeout` contains the correlation ID and configured deadline.
+- `ProxyError::Transport` wraps bus, connection, and codec failures.
+- `ProxyError::RuntimeStopped` reports failure of the local reply dispatcher.
+
+Configure the callee with
+`.errors_to(BrokerTarget::reply_to(bus.clone()))` so handler and delivery
+failures return immediately to the waiting proxy with the same correlation ID.
+Without an error reply, the caller cannot distinguish a silent callee from a
+lost message and eventually returns `ProxyError::Timeout`.
+
+`Proxy` is a public trait implemented by `BrokerProxy`. Applications can accept
+`P: Proxy` and consumers can implement the same abstraction for HTTP, gRPC, or
+other request/reply transports while choosing their own associated error type.
 
 ## HTTP Routing
 

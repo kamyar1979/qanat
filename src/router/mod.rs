@@ -2,6 +2,7 @@ pub mod app;
 pub mod broker;
 pub mod config;
 pub mod core;
+pub mod proxy;
 
 #[cfg(feature = "axum")]
 pub use crate::http::{
@@ -20,7 +21,9 @@ pub use config::{
     RouteManifest,
 };
 pub use core::{
-    Bind, FailedRouteMessage, FromRouteHeader, FromRouteMessage, IntoRouteHandler, RouteError,
-    RouteErrorStage, RouteFailure, RouteFrom, RouteHandler, RouteHeader, RouteHeaders,
-    RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget, Router, TypedRouteHandler,
+    Bind, FailedRouteMessage, FromRouteHeader, FromRouteMessage, IntoRouteHandler,
+    ROUTE_FAILURE_HEADER, RouteError, RouteErrorStage, RouteFailure, RouteFrom, RouteHandler,
+    RouteHeader, RouteHeaders, RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget,
+    Router, TypedRouteHandler,
 };
+pub use proxy::{Proxy, ProxyError};

@@ -9,6 +9,7 @@ use crate::errors::BusError;
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
 use crate::router::core::{FromRouteMessage, RouteHeader, RouteHeaders, RouteMessage};
+use crate::router::{Proxy, ProxyError, ROUTE_FAILURE_HEADER, RouteFailure};
 use futures::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::{OnceCell, mpsc, oneshot};
@@ -282,7 +283,7 @@ where
         })
     }
 
-    pub async fn call<I, O>(&self, input: &I) -> Result<O, BusError>
+    pub async fn call<I, O>(&self, input: &I) -> Result<O, ProxyError>
     where
         I: Serialize + Sync,
         O: DeserializeOwned,
@@ -294,17 +295,21 @@ where
         &self,
         input: &I,
         mut headers: HashMap<String, String>,
-    ) -> Result<O, BusError>
+    ) -> Result<O, ProxyError>
     where
         I: Serialize + Sync,
         O: DeserializeOwned,
     {
-        let runtime = self.runtime.get_or_try_init(|| self.initialize()).await?;
+        let runtime = self
+            .runtime
+            .get_or_try_init(|| self.initialize())
+            .await
+            .map_err(ProxyError::from)?;
         let commands = &runtime.commands;
         let reply_subject = &runtime.reply_subject;
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         let correlation_id = Uuid::new_v4().to_string();
-        let payload = self.codec.encode(input)?;
+        let payload = self.codec.encode(input).map_err(ProxyError::from)?;
 
         headers.insert(CORRELATION_ID_HEADER.to_string(), correlation_id.clone());
         headers.insert(REPLY_TO_HEADER.to_string(), reply_subject.clone());
@@ -318,10 +323,10 @@ where
                 registered: registered_tx,
             })
             .await
-            .map_err(|_| BusError::Internal("broker proxy reply task stopped".into()))?;
+            .map_err(|_| ProxyError::RuntimeStopped("reply command channel closed".into()))?;
         registered_rx
             .await
-            .map_err(|_| BusError::Internal("broker proxy reply task stopped".into()))?;
+            .map_err(|_| ProxyError::RuntimeStopped("request registration was dropped".into()))?;
 
         let request = RawMessage {
             envelope: Envelope {
@@ -335,28 +340,61 @@ where
         };
         if let Err(error) = self.bus.dispatch(&self.route.pattern, request).await {
             let _ = commands.try_send(ProxyCommand::Cancel { correlation_id });
-            return Err(error);
+            return Err(ProxyError::Transport(error));
         }
 
         let reply = match tokio::time::timeout(self.timeout, reply_rx).await {
             Ok(Ok(reply)) => reply,
             Ok(Err(_)) => {
-                return Err(BusError::Internal(
-                    "broker proxy reply task stopped before delivering a response".into(),
+                return Err(ProxyError::RuntimeStopped(
+                    "reply task stopped before delivering a response".into(),
                 ));
             }
             Err(_) => {
                 let _ = commands.try_send(ProxyCommand::Cancel {
                     correlation_id: correlation_id.clone(),
                 });
-                return Err(BusError::Timeout(format!(
-                    "broker request '{correlation_id}' timed out after {:?}",
-                    self.timeout
-                )));
+                return Err(ProxyError::Timeout {
+                    correlation_id,
+                    timeout: self.timeout,
+                });
             }
         };
 
-        self.codec.decode(&reply.payload)
+        if reply
+            .envelope
+            .headers
+            .as_ref()
+            .is_some_and(|headers| headers.contains_key(ROUTE_FAILURE_HEADER))
+        {
+            let failure: RouteFailure = self
+                .codec
+                .decode(&reply.payload)
+                .map_err(ProxyError::from)?;
+            return Err(ProxyError::Remote(failure));
+        }
+
+        self.codec.decode(&reply.payload).map_err(ProxyError::from)
+    }
+}
+
+impl<B, C> Proxy for BrokerProxy<B, C>
+where
+    B: Bus<Message = RawMessage> + 'static,
+    C: Codec,
+{
+    type Error = ProxyError;
+
+    async fn call_with_headers<I, O>(
+        &self,
+        input: &I,
+        headers: HashMap<String, String>,
+    ) -> Result<O, Self::Error>
+    where
+        I: Serialize + Sync,
+        O: DeserializeOwned,
+    {
+        BrokerProxy::call_with_headers(self, input, headers).await
     }
 }
 
@@ -821,7 +859,85 @@ mod tests {
 
         let result = proxy.call::<_, TestReply>(&TestMessage { id: 41 }).await;
 
-        assert!(matches!(result, Err(BusError::Timeout(_))));
+        assert!(matches!(result, Err(ProxyError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn broker_proxy_returns_remote_handler_failure() {
+        let bus = LoopbackBus::default();
+        let mut router =
+            crate::router::Router::new()
+                .bind(|_message: TestMessage| async move {
+                    Result::<TestReply, _>::Err("order rejected")
+                })
+                .errors_to(BrokerTarget::reply_to(bus.clone()))
+                .from(BrokerSource::new(
+                    bus.clone(),
+                    "orders.process",
+                    "orders.rpc",
+                ))
+                .to(BrokerTarget::reply_to(bus.clone()));
+        router.install().await.unwrap();
+        let proxy = BrokerProxy::new(bus, BrokerRoute::new("orders.process", "orders.rpc"))
+            .timeout(Duration::from_secs(1));
+
+        let result = proxy.call::<_, TestReply>(&TestMessage { id: 41 }).await;
+
+        let Err(ProxyError::Remote(failure)) = result else {
+            panic!("expected a remote route failure");
+        };
+        assert_eq!(failure.error.stage, crate::router::RouteErrorStage::Handler);
+        assert!(failure.error.message.contains("order rejected"));
+        assert_eq!(failure.original.address, "orders.process");
+    }
+
+    #[tokio::test]
+    async fn broker_proxy_ignores_forged_failure_marker_on_success() {
+        let bus = LoopbackBus::default();
+        let mut router = crate::router::Router::new()
+            .bind(|message: TestMessage| async move {
+                Ok::<_, std::convert::Infallible>(TestReply { id: message.id + 1 })
+            })
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.process",
+                "orders.rpc",
+            ))
+            .to(BrokerTarget::reply_to(bus.clone()));
+        router.install().await.unwrap();
+        let proxy = BrokerProxy::new(bus, BrokerRoute::new("orders.process", "orders.rpc"))
+            .timeout(Duration::from_secs(1));
+
+        let reply: TestReply = proxy
+            .call_with_headers(
+                &TestMessage { id: 41 },
+                HashMap::from([(ROUTE_FAILURE_HEADER.to_string(), "true".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(reply.id, 42);
+    }
+
+    #[tokio::test]
+    async fn broker_proxy_implements_extensible_proxy_trait() {
+        async fn invoke<P>(proxy: &P) -> Result<TestReply, P::Error>
+        where
+            P: crate::router::Proxy,
+        {
+            proxy.call(&TestMessage { id: 41 }).await
+        }
+
+        let proxy = BrokerProxy::new(
+            LoopbackBus::default(),
+            BrokerRoute::new("orders.missing", "orders.rpc"),
+        )
+        .timeout(Duration::from_millis(10));
+
+        assert!(matches!(
+            invoke(&proxy).await,
+            Err(ProxyError::Timeout { .. })
+        ));
     }
 
     #[tokio::test]
