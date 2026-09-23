@@ -13,6 +13,21 @@ pub struct RawMessage {
 }
 
 impl RawMessage {
+    /// Decode metadata-bearing messages, using the supplied codec's header policy.
+    /// Use decode for headerless transports, which must use a fixed configured format.
+    pub fn decode_with_headers<T: DeserializeOwned>(
+        &self,
+        codec: &crate::codec::HeaderAwareCodec<impl crate::codec::CodecCollection>,
+    ) -> Result<T, BusError> {
+        codec.decode_with_content_type(
+            &self.payload,
+            self.envelope
+                .headers
+                .as_ref()
+                .and_then(crate::codec::content_type),
+        )
+    }
+
     pub fn decode<T: DeserializeOwned>(&self, codec: &impl Codec) -> Result<T, BusError> {
         codec.decode(&self.payload)
     }
@@ -46,6 +61,18 @@ mod tests {
         let message = raw_message(JsonCodec.encode(&42u32).unwrap());
 
         assert_eq!(message.decode::<u32>(&JsonCodec).unwrap(), 42);
+    }
+
+    #[test]
+    fn explicit_header_decoding_rejects_unknown_format() {
+        let mut message = raw_message(JsonCodec.encode(&42u32).unwrap());
+        message.envelope.headers = Some(std::collections::HashMap::from([(
+            "Content-Type".into(),
+            "application/unknown".into(),
+        )]));
+        let codec = crate::codec::HeaderAwareCodec::default();
+        assert!(message.decode_with_headers::<u32>(&codec).is_err());
+        assert_eq!(message.decode::<u32>(&codec).unwrap(), 42);
     }
 
     #[test]

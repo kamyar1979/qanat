@@ -21,7 +21,7 @@ pub use config::{
     RouteManifest,
 };
 pub use core::{
-    Bind, FailedRouteMessage, FromRouteHeader, FromRouteMessage, IntoRouteHandler,
+    Bind, FailedRouteMessage, FromRouteHeader, FromRouteMessage, IntoRouteHandler, PayloadValue,
     ROUTE_FAILURE_HEADER, RouteError, RouteErrorStage, RouteFailure, RouteFrom, RouteHandler,
     RouteHeader, RouteHeaders, RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget,
     Router, TypedRouteHandler,

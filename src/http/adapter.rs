@@ -14,10 +14,10 @@ mod source_impl {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
 
-    use crate::codec::{Codec, JsonCodec};
+    use crate::codec::{BuiltinCodecs, CodecCollection, HeaderAwareCodec, content_type};
     use crate::errors::BusError;
     use crate::http::HttpMethod;
-    use crate::router::{FromRouteMessage, RouteMessage, RouteSource, RouteStream};
+    use crate::router::{FromRouteMessage, PayloadValue, RouteMessage, RouteSource, RouteStream};
 
     pub const DEFAULT_HTTP_SOURCE_CAPACITY: usize = 64;
     pub const DEFAULT_HTTP_BODY_LIMIT: usize = 2 * 1024 * 1024;
@@ -31,12 +31,14 @@ mod source_impl {
     #[derive(Clone, Debug)]
     pub struct HttpQuery<T>(pub T);
 
-    impl<T, C> FromRouteMessage<C> for HttpPath<T>
+    impl<T> FromRouteMessage for HttpPath<T>
     where
         T: DeserializeOwned,
-        C: Codec,
     {
-        fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        fn from_message(
+            message: &RouteMessage,
+            _decoder: &dyn RouteSource,
+        ) -> Result<Self, BusError> {
             let parameters = message
                 .metadata
                 .iter()
@@ -53,12 +55,14 @@ mod source_impl {
         }
     }
 
-    impl<T, C> FromRouteMessage<C> for HttpQuery<T>
+    impl<T> FromRouteMessage for HttpQuery<T>
     where
         T: DeserializeOwned,
-        C: Codec,
     {
-        fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+        fn from_message(
+            message: &RouteMessage,
+            _decoder: &dyn RouteSource,
+        ) -> Result<Self, BusError> {
             let query = message
                 .address
                 .split_once('?')
@@ -70,12 +74,13 @@ mod source_impl {
         }
     }
 
-    pub struct HttpSource {
+    pub struct HttpSource<C: CodecCollection = BuiltinCodecs> {
         method: HttpMethod,
         path: String,
         sender: mpsc::Sender<RouteMessage>,
-        receiver: mpsc::Receiver<RouteMessage>,
+        receiver: Option<mpsc::Receiver<RouteMessage>>,
         body_limit: usize,
+        codec: HeaderAwareCodec<C>,
     }
 
     impl HttpSource {
@@ -89,8 +94,9 @@ mod source_impl {
                 method,
                 path: path.into(),
                 sender,
-                receiver,
+                receiver: Some(receiver),
                 body_limit: DEFAULT_HTTP_BODY_LIMIT,
+                codec: HeaderAwareCodec::default(),
             }
         }
 
@@ -117,6 +123,19 @@ mod source_impl {
         pub fn with_body_limit(mut self, body_limit: usize) -> Self {
             self.body_limit = body_limit;
             self
+        }
+    }
+
+    impl<C: CodecCollection> HttpSource<C> {
+        pub fn with_codec<D: CodecCollection>(self, codec: HeaderAwareCodec<D>) -> HttpSource<D> {
+            HttpSource {
+                method: self.method,
+                path: self.path,
+                sender: self.sender,
+                receiver: self.receiver,
+                body_limit: self.body_limit,
+                codec,
+            }
         }
 
         pub fn method(&self) -> HttpMethod {
@@ -164,9 +183,19 @@ mod source_impl {
         }
     }
 
-    impl RouteSource for HttpSource {
-        fn into_stream(self: Box<Self>) -> LocalBoxFuture<'static, Result<RouteStream, BusError>> {
-            Box::pin(async move { Ok(Box::pin(ReceiverStream::new(self.receiver)) as RouteStream) })
+    impl<C: CodecCollection> RouteSource for HttpSource<C> {
+        fn decode(&self, message: &RouteMessage) -> Result<PayloadValue, BusError> {
+            self.codec
+                .decode_with_content_type(&message.payload, content_type(&message.headers))
+        }
+
+        fn open(&mut self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>> {
+            let receiver = self.receiver.take();
+            Box::pin(async move {
+                let receiver = receiver
+                    .ok_or_else(|| BusError::Internal("HTTP source already opened".into()))?;
+                Ok(Box::pin(ReceiverStream::new(receiver)) as RouteStream)
+            })
         }
     }
 
@@ -211,30 +240,19 @@ mod source_impl {
         }
     }
 
-    pub struct HttpRouter<C: Codec = JsonCodec> {
+    pub struct HttpRouter {
         router: axum::Router,
-        codec: C,
     }
 
-    impl HttpRouter<JsonCodec> {
+    impl HttpRouter {
         pub fn new() -> Self {
-            Self::with_codec(JsonCodec)
-        }
-    }
-
-    impl<C> HttpRouter<C>
-    where
-        C: Codec,
-    {
-        pub fn with_codec(codec: C) -> Self {
             Self {
                 router: axum::Router::new(),
-                codec,
             }
         }
 
-        pub fn from_router(router: axum::Router, codec: C) -> Self {
-            Self { router, codec }
+        pub fn from_router(router: axum::Router) -> Self {
+            Self { router }
         }
 
         pub fn route(mut self, path: &str, method_router: MethodRouter) -> Self {
@@ -242,7 +260,7 @@ mod source_impl {
             self
         }
 
-        pub fn source(self, source: &HttpSource) -> Self {
+        pub fn source<C: CodecCollection>(self, source: &HttpSource<C>) -> Self {
             self.route(source.path(), source.method_router())
         }
 
@@ -300,16 +318,12 @@ mod source_impl {
             &self.router
         }
 
-        pub fn codec(&self) -> &C {
-            &self.codec
-        }
-
         pub fn into_router(self) -> axum::Router {
             self.router
         }
     }
 
-    impl Default for HttpRouter<JsonCodec> {
+    impl Default for HttpRouter {
         fn default() -> Self {
             Self::new()
         }
@@ -328,10 +342,10 @@ mod source_impl {
         use tower::ServiceExt;
 
         use crate::bus::Bus;
-        use crate::codec::Codec;
+        use crate::codec::{Codec, JsonCodec};
         use crate::http::{HttpResponse, HttpTarget};
         use crate::raw_message::RawMessage;
-        use crate::router::{BrokerTarget, RouteMessage, RouteTarget, Router};
+        use crate::router::{BrokerTarget, PayloadValue, RouteMessage, RouteTarget, Router};
         use futures::future::BoxFuture;
 
         #[derive(Deserialize)]
@@ -380,6 +394,15 @@ mod source_impl {
         }
 
         impl RouteTarget for CaptureTarget {
+            fn encode(
+                &self,
+                value: &PayloadValue,
+                message: &mut RouteMessage,
+            ) -> Result<(), BusError> {
+                message.payload = JsonCodec.encode(value)?;
+                Ok(())
+            }
+
             fn deliver(&self, output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
                 Box::pin(async move {
                     self.outputs
@@ -436,10 +459,10 @@ mod source_impl {
         }
 
         #[test]
-        fn http_router_accepts_explicit_codec() {
-            let router = HttpRouter::with_codec(crate::codec::JsonCodec).get("/health", health);
+        fn http_router_does_not_own_serialization_state() {
+            let router = HttpRouter::new().get("/health", health);
 
-            let _: &crate::codec::JsonCodec = router.codec();
+            let _: axum::Router = router.into_router();
         }
 
         #[tokio::test]
@@ -498,7 +521,7 @@ mod source_impl {
                 .await
                 .unwrap()
                 .unwrap();
-            let decoded: OrderResponse = routes.codec().decode(&output.payload).unwrap();
+            let decoded: OrderResponse = JsonCodec.decode(&output.payload).unwrap();
 
             assert_eq!(response.status(), StatusCode::ACCEPTED);
             assert_eq!(output.address, "/orders");
@@ -554,7 +577,7 @@ mod source_impl {
                     .await
                     .unwrap()
                     .unwrap();
-            let decoded: OrderResponse = routes.codec().decode(&message.payload).unwrap();
+            let decoded: OrderResponse = JsonCodec.decode(&message.payload).unwrap();
             let headers = message.envelope.headers.unwrap();
 
             assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -606,8 +629,7 @@ mod source_impl {
                     .await
                     .unwrap()
                     .unwrap();
-            let failure: crate::router::RouteFailure =
-                routes.codec().decode(&message.payload).unwrap();
+            let failure: crate::router::RouteFailure = JsonCodec.decode(&message.payload).unwrap();
             let headers = message.envelope.headers.unwrap();
 
             assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -664,7 +686,7 @@ mod source_impl {
                     .await
                     .unwrap()
                     .unwrap();
-            let decoded: OrderResponse = routes.codec().decode(&forwarded.body).unwrap();
+            let decoded: OrderResponse = JsonCodec.decode(&forwarded.body).unwrap();
 
             assert_eq!(response.status(), StatusCode::ACCEPTED);
             assert_eq!(forwarded.url, "http://downstream.test/events");
@@ -727,8 +749,9 @@ mod target_impl {
     use bytes::Bytes;
     use futures::future::BoxFuture;
 
+    use crate::codec::{Codec, HeaderAwareCodec, set_content_type};
     use crate::errors::{BackendError, BusError};
-    use crate::router::{REPLY_TO_HEADER, RouteMessage, RouteTarget};
+    use crate::router::{PayloadValue, REPLY_TO_HEADER, RouteMessage, RouteTarget};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum HttpMethod {
@@ -801,10 +824,11 @@ mod target_impl {
     }
 
     #[derive(Clone)]
-    pub struct HttpTarget {
+    pub struct HttpTarget<C: Codec = HeaderAwareCodec> {
         method: HttpMethod,
         url: String,
         invoker: Arc<dyn HttpInvoker>,
+        codec: C,
     }
 
     impl HttpTarget {
@@ -813,6 +837,7 @@ mod target_impl {
                 method,
                 url: url.into(),
                 invoker: Arc::new(invoker),
+                codec: HeaderAwareCodec::default(),
             }
         }
 
@@ -842,6 +867,17 @@ mod target_impl {
 
         pub fn url(&self) -> &str {
             &self.url
+        }
+    }
+
+    impl<C: Codec> HttpTarget<C> {
+        pub fn with_codec<D: Codec>(self, codec: D) -> HttpTarget<D> {
+            HttpTarget {
+                method: self.method,
+                url: self.url,
+                invoker: self.invoker,
+                codec,
+            }
         }
 
         pub async fn send(
@@ -873,7 +909,7 @@ mod target_impl {
         }
     }
 
-    impl std::fmt::Debug for HttpTarget {
+    impl<C: Codec> std::fmt::Debug for HttpTarget<C> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("HttpTarget")
                 .field("method", &self.method)
@@ -882,7 +918,13 @@ mod target_impl {
         }
     }
 
-    impl RouteTarget for HttpTarget {
+    impl<C: Codec> RouteTarget for HttpTarget<C> {
+        fn encode(&self, value: &PayloadValue, message: &mut RouteMessage) -> Result<(), BusError> {
+            message.payload = self.codec.encode(value)?;
+            set_content_type(&mut message.headers, self.codec.content_type());
+            Ok(())
+        }
+
         fn deliver(&self, output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
             Box::pin(async move {
                 let mut headers = output.headers;

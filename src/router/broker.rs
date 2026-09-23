@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::bus::Bus;
-use crate::codec::{Codec, JsonCodec};
+use crate::codec::{
+    BuiltinCodecs, Codec, CodecCollection, HeaderAwareCodec, content_type, set_content_type,
+};
 use crate::errors::BusError;
 use crate::message::Envelope;
 use crate::raw_message::RawMessage;
-use crate::router::core::{FromRouteMessage, RouteHeader, RouteHeaders, RouteMessage};
+use crate::router::core::{FromRouteMessage, RouteHeader, RouteHeaders, RouteMessage, RouteSource};
 use crate::router::{Proxy, ProxyError, ROUTE_FAILURE_HEADER, RouteFailure};
 use futures::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
@@ -103,8 +105,8 @@ pub(crate) fn broker_message_from_route(message: RouteMessage) -> RawMessage {
 #[derive(Clone, Debug)]
 pub struct BrokerEnvelope(pub Envelope);
 
-impl<C: Codec> FromRouteMessage<C> for BrokerEnvelope {
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+impl FromRouteMessage for BrokerEnvelope {
+    fn from_message(message: &RouteMessage, _decoder: &dyn RouteSource) -> Result<Self, BusError> {
         Ok(Self(broker_message_from_route(message.clone()).envelope))
     }
 }
@@ -116,8 +118,8 @@ pub use crate::router::core::FromRouteHeader as FromBrokerHeader;
 #[derive(Clone, Debug)]
 pub struct BrokerRawMessage(pub RawMessage);
 
-impl<C: Codec> FromRouteMessage<C> for BrokerRawMessage {
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+impl FromRouteMessage for BrokerRawMessage {
+    fn from_message(message: &RouteMessage, _decoder: &dyn RouteSource) -> Result<Self, BusError> {
         Ok(Self(broker_message_from_route(message.clone())))
     }
 }
@@ -139,30 +141,26 @@ struct ProxyRuntime {
     task: tokio::task::JoinHandle<()>,
 }
 
-pub struct BrokerProxy<B: Bus, C: Codec = JsonCodec> {
+pub struct BrokerProxy<B: Bus, C: CodecCollection = BuiltinCodecs> {
     bus: Arc<B>,
-    codec: Arc<C>,
+    codec: HeaderAwareCodec<C>,
     route: BrokerRoute,
     timeout: Duration,
     runtime: OnceCell<ProxyRuntime>,
 }
 
-impl<B: Bus> BrokerProxy<B, JsonCodec> {
+impl<B: Bus> BrokerProxy<B> {
     pub fn new(bus: B, route: BrokerRoute) -> Self {
-        Self::with_codec(bus, JsonCodec, route)
+        Self::with_codec(bus, HeaderAwareCodec::default(), route)
     }
 }
 
-impl<B, C> BrokerProxy<B, C>
-where
-    B: Bus,
-    C: Codec,
-{
-    pub fn with_codec(bus: B, codec: C, route: BrokerRoute) -> Self {
-        Self::from_shared(Arc::new(bus), Arc::new(codec), route)
+impl<B: Bus, C: CodecCollection> BrokerProxy<B, C> {
+    pub fn with_codec(bus: B, codec: HeaderAwareCodec<C>, route: BrokerRoute) -> Self {
+        Self::from_shared(Arc::new(bus), codec, route)
     }
 
-    fn from_shared(bus: Arc<B>, codec: Arc<C>, mut route: BrokerRoute) -> Self {
+    fn from_shared(bus: Arc<B>, codec: HeaderAwareCodec<C>, mut route: BrokerRoute) -> Self {
         if route.reply_to.is_none() && route.reply_topic_prefix.is_none() {
             route.reply_topic_prefix = Some(DEFAULT_REPLY_TOPIC_PREFIX.to_string());
         }
@@ -202,7 +200,7 @@ where
         self.bus.as_ref()
     }
 
-    pub fn codec(&self) -> &C {
+    pub fn codec(&self) -> &HeaderAwareCodec<C> {
         &self.codec
     }
 
@@ -217,10 +215,9 @@ where
     }
 }
 
-impl<B, C> BrokerProxy<B, C>
+impl<B, C: CodecCollection> BrokerProxy<B, C>
 where
     B: Bus<Message = RawMessage> + 'static,
-    C: Codec,
 {
     async fn initialize(&self) -> Result<ProxyRuntime, BusError> {
         let reply_subject = match &self.route.reply_to {
@@ -313,6 +310,9 @@ where
 
         headers.insert(CORRELATION_ID_HEADER.to_string(), correlation_id.clone());
         headers.insert(REPLY_TO_HEADER.to_string(), reply_subject.clone());
+        if self.bus.supports_content_type_headers() {
+            set_content_type(&mut headers, self.codec.content_type());
+        }
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let (registered_tx, registered_rx) = oneshot::channel();
@@ -367,21 +367,44 @@ where
             .as_ref()
             .is_some_and(|headers| headers.contains_key(ROUTE_FAILURE_HEADER))
         {
+            let reply_content_type = reply
+                .envelope
+                .headers
+                .as_ref()
+                .and_then(|headers| content_type(headers));
             let failure: RouteFailure = self
                 .codec
-                .decode(&reply.payload)
+                .decode_with_content_type(
+                    &reply.payload,
+                    self.bus
+                        .supports_content_type_headers()
+                        .then_some(reply_content_type)
+                        .flatten(),
+                )
                 .map_err(ProxyError::from)?;
             return Err(ProxyError::Remote(failure));
         }
 
-        self.codec.decode(&reply.payload).map_err(ProxyError::from)
+        let reply_content_type = reply
+            .envelope
+            .headers
+            .as_ref()
+            .and_then(|headers| content_type(headers));
+        self.codec
+            .decode_with_content_type(
+                &reply.payload,
+                self.bus
+                    .supports_content_type_headers()
+                    .then_some(reply_content_type)
+                    .flatten(),
+            )
+            .map_err(ProxyError::from)
     }
 }
 
-impl<B, C> Proxy for BrokerProxy<B, C>
+impl<B, C: CodecCollection> Proxy for BrokerProxy<B, C>
 where
     B: Bus<Message = RawMessage> + 'static,
-    C: Codec,
 {
     type Error = ProxyError;
 
@@ -398,7 +421,7 @@ where
     }
 }
 
-impl<B: Bus, C: Codec> Drop for BrokerProxy<B, C> {
+impl<B: Bus, C: CodecCollection> Drop for BrokerProxy<B, C> {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.get() {
             let task = &runtime.task;
@@ -457,7 +480,7 @@ mod tests {
     use crate::codec::Codec;
     use crate::http::HttpTarget;
     use crate::message::Envelope;
-    use crate::router::RouteTarget;
+    use crate::router::{PayloadValue, RouteTarget};
     use futures::future::BoxFuture;
     use futures::stream;
     use std::collections::HashMap;
@@ -665,6 +688,11 @@ mod tests {
     }
 
     impl RouteTarget for CaptureTarget {
+        fn encode(&self, value: &PayloadValue, message: &mut RouteMessage) -> Result<(), BusError> {
+            message.payload = crate::codec::JsonCodec.encode(value)?;
+            Ok(())
+        }
+
         fn deliver(&self, output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
             Box::pin(async move {
                 self.sender
@@ -724,9 +752,9 @@ mod tests {
     }
 
     #[test]
-    fn neutral_router_owns_the_codec() {
+    fn neutral_router_gets_serialization_from_its_endpoints() {
         let bus = FakeBus::new();
-        let router = crate::router::Router::with_codec(crate::codec::JsonCodec)
+        let router = crate::router::Router::new()
             .bind(handle_test_message)
             .from(BrokerSource::new(
                 bus.clone(),
@@ -735,7 +763,6 @@ mod tests {
             ))
             .to(BrokerTarget::new(bus, "orders.processed"));
 
-        let _: &crate::codec::JsonCodec = router.codec();
         assert_eq!(router.route_count(), 1);
     }
 
@@ -778,7 +805,7 @@ mod tests {
         assert_eq!(proxy.route().reply_to.as_deref(), Some("orders.reply"));
         assert_eq!(proxy.route().reply_topic_prefix, None);
         assert_eq!(proxy.bus().group_subscription_count(), 0);
-        let _: &crate::codec::JsonCodec = proxy.codec();
+        assert_eq!(proxy.codec().content_type(), "application/json");
     }
 
     #[tokio::test]
@@ -966,7 +993,9 @@ mod tests {
             "orders.created",
             raw_message(
                 "orders.created",
-                router.codec().encode(&TestMessage { id: 42 }).unwrap(),
+                crate::codec::JsonCodec
+                    .encode(&TestMessage { id: 42 })
+                    .unwrap(),
                 None,
             ),
         )
@@ -1000,14 +1029,16 @@ mod tests {
             "orders.created",
             raw_message(
                 "orders.created",
-                router.codec().encode(&TestMessage { id: 42 }).unwrap(),
+                crate::codec::JsonCodec
+                    .encode(&TestMessage { id: 42 })
+                    .unwrap(),
                 None,
             ),
         )
         .await
         .unwrap();
         let reply = replies.next().await.unwrap();
-        let decoded: TestReply = router.codec().decode(&reply.payload).unwrap();
+        let decoded: TestReply = crate::codec::JsonCodec.decode(&reply.payload).unwrap();
 
         assert_eq!(reply.envelope.subject, "orders.processed");
         assert_eq!(decoded.id, 43);
@@ -1030,7 +1061,9 @@ mod tests {
         router.install().await.unwrap();
         let message = raw_message(
             "orders.created",
-            router.codec().encode(&TestMessage { id: 42 }).unwrap(),
+            crate::codec::JsonCodec
+                .encode(&TestMessage { id: 42 })
+                .unwrap(),
             Some(HashMap::from([
                 (CORRELATION_ID_HEADER.to_string(), "request-42".to_string()),
                 (REPLY_TO_HEADER.to_string(), "instance.reply.7".to_string()),
@@ -1083,7 +1116,9 @@ mod tests {
         router.install().await.unwrap();
         let message = raw_message(
             "orders.created",
-            router.codec().encode(&TestMessage { id: 42 }).unwrap(),
+            crate::codec::JsonCodec
+                .encode(&TestMessage { id: 42 })
+                .unwrap(),
             Some(HashMap::from([(
                 "correlation_id".to_string(),
                 "request-1".to_string(),
@@ -1100,8 +1135,11 @@ mod tests {
         let message =
             route_message_from_broker(raw_message("orders.created", bytes::Bytes::new(), None));
 
-        let err = RouteHeader::<CorrelationId>::from_message(&message, &crate::codec::JsonCodec)
-            .unwrap_err();
+        let err = RouteHeader::<CorrelationId>::from_message(
+            &message,
+            &BrokerSource::new(FakeBus::new(), "test", "test"),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("missing route header 'correlation_id'")
@@ -1162,7 +1200,9 @@ mod tests {
                 "orders.created",
                 raw_message(
                     "orders.created",
-                    router.codec().encode(&TestMessage { id: 41 }).unwrap(),
+                    crate::codec::JsonCodec
+                        .encode(&TestMessage { id: 41 })
+                        .unwrap(),
                     Some(HashMap::from([
                         (CORRELATION_ID_HEADER.to_string(), "request-41".to_string()),
                         ("x-internal".to_string(), "secret".to_string()),
@@ -1176,7 +1216,7 @@ mod tests {
             .await
             .expect("HTTP target was not invoked")
             .expect("HTTP target channel closed");
-        let reply: TestReply = router.codec().decode(&request.body).unwrap();
+        let reply: TestReply = crate::codec::JsonCodec.decode(&request.body).unwrap();
 
         assert_eq!(request.method, crate::http::HttpMethod::Post);
         assert_eq!(request.url, "http://orders.test/events");
@@ -1221,7 +1261,9 @@ mod tests {
             "orders.created",
             raw_message(
                 "orders.created",
-                router.codec().encode(&TestMessage { id: 41 }).unwrap(),
+                crate::codec::JsonCodec
+                    .encode(&TestMessage { id: 41 })
+                    .unwrap(),
                 None,
             ),
         )
@@ -1232,7 +1274,8 @@ mod tests {
             .await
             .expect("broker error target was not invoked")
             .expect("broker error subscription ended");
-        let failure: crate::router::RouteFailure = router.codec().decode(&error.payload).unwrap();
+        let failure: crate::router::RouteFailure =
+            crate::codec::JsonCodec.decode(&error.payload).unwrap();
 
         assert_eq!(error.envelope.subject, "orders.errors");
         assert_eq!(failure.error.stage, crate::router::RouteErrorStage::Handler);
@@ -1269,7 +1312,9 @@ mod tests {
                 "orders.created",
                 raw_message(
                     "orders.created",
-                    router.codec().encode(&TestMessage { id: 41 }).unwrap(),
+                    crate::codec::JsonCodec
+                        .encode(&TestMessage { id: 41 })
+                        .unwrap(),
                     None,
                 ),
             )
@@ -1280,7 +1325,8 @@ mod tests {
             .await
             .expect("HTTP error target was not invoked")
             .expect("HTTP error target channel closed");
-        let failure: crate::router::RouteFailure = router.codec().decode(&request.body).unwrap();
+        let failure: crate::router::RouteFailure =
+            crate::codec::JsonCodec.decode(&request.body).unwrap();
 
         assert_eq!(request.url, "http://orders.test/errors");
         assert_eq!(

@@ -67,6 +67,12 @@ pub trait Bus: Send + Sync {
     type Message: Clone + Send + 'static;
     type Subscription: Stream<Item = Self::Message> + Send + Unpin + 'static;
 
+    /// Whether this transport exposes a native content-type header that route
+    /// adapters can use for per-message codec selection.
+    fn supports_content_type_headers(&self) -> bool {
+        false
+    }
+
     /// Route and deliver an already-constructed message to local subscribers.
     fn dispatch<'a>(
         &'a self,
@@ -93,6 +99,10 @@ pub trait ExternalBus: Send + Sync {
 
     fn codec(&self) -> &Self::Codec;
 
+    fn supports_content_type_headers(&self) -> bool {
+        false
+    }
+
     fn publish<'a, T: Serialize>(
         &'a self,
         subject: &'a str,
@@ -100,7 +110,13 @@ pub trait ExternalBus: Send + Sync {
         headers: Option<HashMap<String, String>>,
     ) -> impl Future<Output = Result<(), BusError>> + Send + 'a {
         let payload = self.codec().encode(value);
-
+        let mut headers = headers;
+        if self.supports_content_type_headers() {
+            crate::codec::set_content_type(
+                headers.get_or_insert_with(HashMap::new),
+                self.codec().content_type(),
+            );
+        }
         async move { self.publish_bytes(subject, payload?, headers).await }
     }
 
@@ -136,6 +152,10 @@ where
 {
     type Message = RawMessage;
     type Subscription = <T as ExternalBus>::Subscription;
+
+    fn supports_content_type_headers(&self) -> bool {
+        ExternalBus::supports_content_type_headers(self)
+    }
 
     fn dispatch<'a>(
         &'a self,

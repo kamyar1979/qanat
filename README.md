@@ -170,13 +170,63 @@ async fn main() -> Result<(), qanat::errors::BusError> {
 }
 ```
 
-Use `Router::with_codec(CborCodec)` or `Router::with_codec(MsgPackCodec)` when
-the corresponding feature is enabled. One router uses one codec for all of its
-bindings.
+Serialization belongs to the source and target adapters. Use their
+`.with_codec(...)` builders to configure each endpoint; the neutral `Router`
+does not own a codec.
 
 Handlers can extract the decoded body, complete broker envelope, all headers,
-individual typed headers, or the raw broker message. The router codec is used
-for both decoding handler input and encoding handler output.
+individual typed headers, or the raw broker message. The source decodes handler
+input and the target encodes handler output, including error targets.
+
+### Header-Aware Serialization
+
+`HeaderAwareCodec::default()` registers JSON and, when enabled, the optional
+`cbor` and `msgpack` formats. HTTP, NATS, and RabbitMQ route sources use the
+incoming `Content-Type` to choose a decoder. Header names and media types are
+case-insensitive; media-type parameters are ignored. Missing headers use the
+configured default. Unknown formats and disabled codecs return serialization
+errors, without falling back to a different format.
+
+Outgoing serialization uses the configured default and replaces `Content-Type`
+with the actual format. Other application headers are preserved. RabbitMQ also
+maps this value to its native AMQP content-type property.
+
+```rust
+use qanat::codec::{Codec, HeaderAwareCodec};
+
+let format = std::env::var("QANAT_CONTENT_TYPE")
+    .unwrap_or_else(|_| "application/json".into());
+let codec = HeaderAwareCodec::default().with_default_content_type(&format)?;
+assert!(!codec.content_type().is_empty());
+# Ok::<(), qanat::errors::BusError>(())
+```
+
+Pass the codec to `BrokerSource::with_codec`, `BrokerTarget::with_codec`,
+`HttpSource::with_codec`, or `HttpTarget::with_codec`. Environment/TOML loading
+is the application's responsibility.
+
+NNG and Redis adapters ignore format headers and use their configured codec
+for both encoding and decoding. Their peers must agree on that format.
+`InMemoryBus` continues transporting Rust objects directly without codecs.
+
+`Codec` supplies typed encoding/decoding and a content-type label, with no
+header-based methods. Implement it to register a custom format with
+`HeaderAwareCodec::default().register(MyCodec)`.
+The wrapper's inherent `decode_with_content_type` method performs selection.
+Sources and proxies accept this wrapper directly; targets accept any codec.
+For a single configured format use `HeaderAwareCodec::new(MyCodec)`.
+Registration builds a statically typed collection: codec selection uses no
+codec trait objects and no closed format enum.
+
+Protocol adapters need not implement a codec. They implement `RouteSource::decode`
+and `RouteTarget::encode` directly, bridging their native message representation
+to `PayloadValue` (Serde's value model). Typed handlers use that model at the
+heterogeneous routing boundary; format-specific Serde extensions may require a
+custom adapter. Sources now implement `open(&mut self)` so the router can retain
+the source's decoding behavior for the lifetime of the route.
+
+Migration: replace `Router::with_codec(...)` with endpoint `.with_codec(...)`
+calls, and `HttpRouter::with_codec(...)` with `HttpRouter::new()`.
 
 Header and payload extraction is transport-neutral:
 
@@ -437,9 +487,10 @@ Use `call_with_headers` to attach application headers. Use `.reply_to(...)` for
 a fixed reply subject or `.reply_topic_prefix(...)` to replace the default
 instance-specific prefix.
 
-`BrokerProxy::new` uses JSON. To use another format, construct it with
-`BrokerProxy::with_codec` and use the same codec as the route serving the
-request.
+`BrokerProxy::new` uses `HeaderAwareCodec` with JSON as the default. To select
+another outgoing format, use `BrokerProxy::with_codec`. Header-capable buses
+negotiate reply decoding by content type; NNG/Redis use the configured default
+for requests and replies, which must match the service's endpoints.
 
 `BrokerProxy::call` follows Rust's `Result` model and returns `ProxyError`:
 

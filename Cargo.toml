@@ -1,6 +1,6 @@
 [package]
 name = "qanat-routing"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Extensible async routing for message buses and HTTP services"
 license = "Apache-2.0"
@@ -28,15 +28,16 @@ futures = "0.3.2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
+serde-value = "0.7"
 serde_json = "1"
 serde_urlencoded = { version = "0.7", optional = true }
 toml = "1.1.2"
-async-nats = { version = "0.38", optional = true }
+async-nats = { version = "0.50.0", optional = true }
 axum = { version = "0.8", optional = true }
 ciborium = { version = "0.2", optional = true }
 nng = { version = "1.0", optional = true }
 redis = { version = "1.2.2", features = ["tokio-comp"], optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-tls"], optional = true }
 rmp-serde = { version = "1", optional = true }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio"], optional = true }
 

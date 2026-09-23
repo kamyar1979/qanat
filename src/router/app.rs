@@ -1,49 +1,41 @@
-use std::marker::PhantomData;
-
-use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
 #[cfg(feature = "axum")]
 use crate::http::HttpRouter;
 use crate::router::core::Router;
 
-pub struct App<C: Codec = JsonCodec> {
-    routes: Option<Router<C>>,
+pub struct App {
+    routes: Option<Router>,
     #[cfg(feature = "axum")]
-    http: Option<HttpRouter<C>>,
-    _codec: PhantomData<fn() -> C>,
+    http: Option<HttpRouter>,
 }
 
-impl App<JsonCodec> {
+impl App {
     pub fn new() -> Self {
         Self {
             routes: None,
             #[cfg(feature = "axum")]
             http: None,
-            _codec: PhantomData,
         }
     }
-}
 
-impl<C: Codec> App<C> {
-    pub fn with_router(router: Router<C>) -> Self {
+    pub fn with_router(router: Router) -> Self {
         Self {
             routes: Some(router),
             #[cfg(feature = "axum")]
             http: None,
-            _codec: PhantomData,
         }
     }
 
-    pub fn router(mut self, router: Router<C>) -> Self {
+    pub fn router(mut self, router: Router) -> Self {
         self.routes = Some(router);
         self
     }
 
-    pub fn routes(&self) -> Option<&Router<C>> {
+    pub fn routes(&self) -> Option<&Router> {
         self.routes.as_ref()
     }
 
-    pub fn routes_mut(&mut self) -> Option<&mut Router<C>> {
+    pub fn routes_mut(&mut self) -> Option<&mut Router> {
         self.routes.as_mut()
     }
 
@@ -55,18 +47,18 @@ impl<C: Codec> App<C> {
     }
 
     #[cfg(feature = "axum")]
-    pub fn http(mut self, http: HttpRouter<C>) -> Self {
+    pub fn http(mut self, http: HttpRouter) -> Self {
         self.http = Some(http);
         self
     }
 
     #[cfg(feature = "axum")]
-    pub fn http_router(&self) -> Option<&HttpRouter<C>> {
+    pub fn http_router(&self) -> Option<&HttpRouter> {
         self.http.as_ref()
     }
 
     #[cfg(feature = "axum")]
-    pub fn into_http_router(self) -> Option<HttpRouter<C>> {
+    pub fn into_http_router(self) -> Option<HttpRouter> {
         self.http
     }
 
@@ -84,7 +76,7 @@ impl<C: Codec> App<C> {
     }
 }
 
-impl Default for App<JsonCodec> {
+impl Default for App {
     fn default() -> Self {
         Self::new()
     }
@@ -176,10 +168,10 @@ mod tests {
 
     #[cfg(feature = "axum")]
     #[test]
-    fn app_accepts_http_router_with_same_codec_type() {
-        let app = App::new().http(HttpRouter::with_codec(crate::codec::JsonCodec));
+    fn app_accepts_http_router() {
+        let app = App::new().http(HttpRouter::new());
 
-        let _: &crate::codec::JsonCodec = app.http_router().unwrap().codec();
+        assert!(app.http_router().is_some());
         assert_eq!(app.router_count(), 1);
     }
 }

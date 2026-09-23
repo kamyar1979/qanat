@@ -9,8 +9,9 @@ use futures::future::{BoxFuture, LocalBoxFuture};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::codec::{Codec, JsonCodec};
 use crate::errors::BusError;
+pub use serde_value::Value as PayloadValue;
+use serde_value::Value;
 
 pub const ROUTE_FAILURE_HEADER: &str = "qanat-route-failure";
 
@@ -157,11 +158,23 @@ pub struct RoutePayload(pub Bytes);
 
 pub type RouteStream = BoxStream<'static, RouteMessage>;
 
-pub trait RouteSource: Send + 'static {
-    fn into_stream(self: Box<Self>) -> LocalBoxFuture<'static, Result<RouteStream, BusError>>;
+pub trait RouteSource: Send + Sync + 'static {
+    fn decode(&self, _message: &RouteMessage) -> Result<Value, BusError> {
+        Err(BusError::Serialization(
+            "source does not support typed payload decoding".into(),
+        ))
+    }
+
+    fn open(&mut self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>>;
 }
 
 pub trait RouteTarget: Send + Sync + 'static {
+    fn encode(&self, _value: &Value, _message: &mut RouteMessage) -> Result<(), BusError> {
+        Err(BusError::Serialization(
+            "target does not support typed payload encoding".into(),
+        ))
+    }
+
     fn accepts(&self, _message: &RouteMessage) -> bool {
         true
     }
@@ -169,37 +182,29 @@ pub trait RouteTarget: Send + Sync + 'static {
     fn deliver(&self, output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>>;
 }
 
-struct RouteBinding<C: Codec> {
+struct RouteBinding {
     source: Option<Box<dyn RouteSource>>,
-    handler: Arc<dyn RouteHandler<C>>,
+    handler: Arc<dyn RouteHandler>,
     target: Arc<dyn RouteTarget>,
     error_target: Option<Arc<dyn RouteTarget>>,
 }
 
-pub struct Router<C: Codec = JsonCodec> {
-    codec: Arc<C>,
-    bindings: Vec<RouteBinding<C>>,
+pub struct Router {
+    bindings: Vec<RouteBinding>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-impl Router<JsonCodec> {
+impl Router {
     pub fn new() -> Self {
-        Self::with_codec(JsonCodec)
-    }
-}
-
-impl<C: Codec> Router<C> {
-    pub fn with_codec(codec: C) -> Self {
         Self {
-            codec: Arc::new(codec),
             bindings: Vec::new(),
             tasks: Vec::new(),
         }
     }
 
-    pub fn bind<H, Args, OutputMode>(self, handler: H) -> Bind<C, Args>
+    pub fn bind<H, Args, OutputMode>(self, handler: H) -> Bind<Args>
     where
-        H: IntoRouteHandler<C, Args, OutputMode>,
+        H: IntoRouteHandler<Args, OutputMode>,
         Args: Send + Sync + 'static,
     {
         Bind {
@@ -208,10 +213,6 @@ impl<C: Codec> Router<C> {
             error_target: None,
             _args: PhantomData,
         }
-    }
-
-    pub fn codec(&self) -> &C {
-        self.codec.as_ref()
     }
 
     pub fn route_count(&self) -> usize {
@@ -224,15 +225,14 @@ impl<C: Codec> Router<C> {
 
     pub async fn install(&mut self) -> Result<(), BusError> {
         for binding in &mut self.bindings {
-            let source = binding
+            let mut source = binding
                 .source
                 .take()
                 .ok_or_else(|| BusError::Internal("route is already installed".into()))?;
-            let mut subscription = source.into_stream().await?;
+            let mut subscription = source.open().await?;
             let handler = Arc::clone(&binding.handler);
             let target = Arc::clone(&binding.target);
             let error_target = binding.error_target.clone();
-            let codec = Arc::clone(&self.codec);
 
             self.tasks.push(tokio::spawn(async move {
                 while let Some(message) = subscription.next().await {
@@ -240,21 +240,22 @@ impl<C: Codec> Router<C> {
                         continue;
                     }
                     let original = message.clone();
-                    match handler.call(message, codec.as_ref()).await {
+                    match handler
+                        .call(message, source.as_ref(), target.as_ref())
+                        .await
+                    {
                         Ok(output) => {
                             if let Err(error) = target.deliver(output).await {
                                 deliver_failure(
                                     error_target.as_ref(),
                                     original,
                                     RouteError::delivery(error),
-                                    codec.as_ref(),
                                 )
                                 .await;
                             }
                         }
                         Err(error) => {
-                            deliver_failure(error_target.as_ref(), original, error, codec.as_ref())
-                                .await;
+                            deliver_failure(error_target.as_ref(), original, error).await;
                         }
                     }
                 }
@@ -264,20 +265,20 @@ impl<C: Codec> Router<C> {
     }
 }
 
-impl Default for Router<JsonCodec> {
+impl Default for Router {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub struct Bind<C: Codec, Args> {
-    router: Router<C>,
-    handler: Arc<dyn RouteHandler<C>>,
+pub struct Bind<Args> {
+    router: Router,
+    handler: Arc<dyn RouteHandler>,
     error_target: Option<Arc<dyn RouteTarget>>,
     _args: PhantomData<fn(Args)>,
 }
 
-impl<C: Codec, Args> Bind<C, Args> {
+impl<Args> Bind<Args> {
     pub fn errors_to<T>(mut self, target: T) -> Self
     where
         T: RouteTarget,
@@ -286,7 +287,7 @@ impl<C: Codec, Args> Bind<C, Args> {
         self
     }
 
-    pub fn from<S>(self, source: S) -> RouteFrom<C, Args>
+    pub fn from<S>(self, source: S) -> RouteFrom<Args>
     where
         S: RouteSource,
     {
@@ -300,16 +301,16 @@ impl<C: Codec, Args> Bind<C, Args> {
     }
 }
 
-pub struct RouteFrom<C: Codec, Args> {
-    router: Router<C>,
-    handler: Arc<dyn RouteHandler<C>>,
+pub struct RouteFrom<Args> {
+    router: Router,
+    handler: Arc<dyn RouteHandler>,
     error_target: Option<Arc<dyn RouteTarget>>,
     source: Box<dyn RouteSource>,
     _args: PhantomData<fn(Args)>,
 }
 
-impl<C: Codec, Args> RouteFrom<C, Args> {
-    pub fn to<T>(mut self, target: T) -> Router<C>
+impl<Args> RouteFrom<Args> {
+    pub fn to<T>(mut self, target: T) -> Router
     where
         T: RouteTarget,
     {
@@ -323,11 +324,12 @@ impl<C: Codec, Args> RouteFrom<C, Args> {
     }
 }
 
-pub trait RouteHandler<C: Codec>: Send + Sync {
+pub trait RouteHandler: Send + Sync {
     fn call<'a>(
         &'a self,
         message: RouteMessage,
-        codec: &'a C,
+        decoder: &'a dyn RouteSource,
+        encoder: &'a dyn RouteTarget,
     ) -> BoxFuture<'a, Result<RouteMessage, RouteError>>;
 }
 
@@ -337,10 +339,8 @@ pub struct PreserveRouteHeaders;
 #[doc(hidden)]
 pub struct ReplaceRouteHeaders;
 
-pub trait IntoRouteHandler<C: Codec, Args, OutputMode = PreserveRouteHeaders>:
-    Send + Sync + 'static
-{
-    fn into_handler(self) -> Arc<dyn RouteHandler<C>>;
+pub trait IntoRouteHandler<Args, OutputMode = PreserveRouteHeaders>: Send + Sync + 'static {
+    fn into_handler(self) -> Arc<dyn RouteHandler>;
 }
 
 pub struct TypedRouteHandler<Args, O, F, OutputMode = PreserveRouteHeaders> {
@@ -351,24 +351,23 @@ pub struct TypedRouteHandler<Args, O, F, OutputMode = PreserveRouteHeaders> {
 fn encode_handler_output<O: Serialize>(
     output: &O,
     mut message: RouteMessage,
-    codec: &impl Codec,
+    encoder: &dyn RouteTarget,
 ) -> Result<RouteMessage, RouteError> {
     message.headers.remove(ROUTE_FAILURE_HEADER);
-    message
-        .headers
-        .entry("content-type".to_string())
-        .or_insert_with(|| codec.content_type().to_string());
     message.timestamp = std::time::Instant::now();
     message.attempts = 0;
-    message.payload = codec.encode(output)?;
+    let value = serde_value::to_value(output)
+        .map_err(|error| RouteError::handler(BusError::Serialization(error.to_string())))?;
+    encoder
+        .encode(&value, &mut message)
+        .map_err(RouteError::delivery)?;
     Ok(message)
 }
 
-async fn deliver_failure<C: Codec>(
+async fn deliver_failure(
     target: Option<&Arc<dyn RouteTarget>>,
     original: RouteMessage,
     error: RouteError,
-    codec: &C,
 ) {
     let Some(target) = target else {
         return;
@@ -378,14 +377,13 @@ async fn deliver_failure<C: Codec>(
         error,
         original: original.into(),
     };
-    let Ok(payload) = codec.encode(&failure) else {
+    let Ok(value) = serde_value::to_value(&failure) else {
         return;
     };
     message.timestamp = std::time::Instant::now();
-    message.payload = payload;
-    message
-        .headers
-        .insert("content-type".to_string(), codec.content_type().to_string());
+    if target.encode(&value, &mut message).is_err() {
+        return;
+    }
     message
         .headers
         .insert(ROUTE_FAILURE_HEADER.to_string(), "true".to_string());
@@ -397,17 +395,16 @@ async fn deliver_failure<C: Codec>(
 
 macro_rules! impl_route_handler {
     ($($argument:ident),+ $(,)?) => {
-        impl<C, $($argument,)+ O, HandlerError, F, Fut>
-            IntoRouteHandler<C, ($($argument,)+), PreserveRouteHeaders> for F
+        impl<$($argument,)+ O, HandlerError, F, Fut>
+            IntoRouteHandler<($($argument,)+), PreserveRouteHeaders> for F
         where
-            C: Codec,
-            $($argument: FromRouteMessage<C> + Send + Sync + 'static,)+
+            $($argument: FromRouteMessage + Send + Sync + 'static,)+
             O: Serialize + Send + Sync + 'static,
             HandlerError: std::fmt::Display + Send + Sync + 'static,
             F: Fn($($argument),+) -> Fut + Send + Sync + 'static,
             Fut: Future<Output = Result<O, HandlerError>> + Send + 'static,
         {
-            fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
+            fn into_handler(self) -> Arc<dyn RouteHandler> {
                 Arc::new(TypedRouteHandler {
                     handler: self,
                     _types: PhantomData::<
@@ -417,17 +414,16 @@ macro_rules! impl_route_handler {
             }
         }
 
-        impl<C, $($argument,)+ O, HandlerError, F, Fut>
-            IntoRouteHandler<C, ($($argument,)+), ReplaceRouteHeaders> for F
+        impl<$($argument,)+ O, HandlerError, F, Fut>
+            IntoRouteHandler<($($argument,)+), ReplaceRouteHeaders> for F
         where
-            C: Codec,
-            $($argument: FromRouteMessage<C> + Send + Sync + 'static,)+
+            $($argument: FromRouteMessage + Send + Sync + 'static,)+
             O: Serialize + Send + Sync + 'static,
             HandlerError: std::fmt::Display + Send + Sync + 'static,
             F: Fn($($argument),+) -> Fut + Send + Sync + 'static,
             Fut: Future<Output = Result<(RouteHeaders, O), HandlerError>> + Send + 'static,
         {
-            fn into_handler(self) -> Arc<dyn RouteHandler<C>> {
+            fn into_handler(self) -> Arc<dyn RouteHandler> {
                 Arc::new(TypedRouteHandler {
                     handler: self,
                     _types: PhantomData::<
@@ -437,7 +433,7 @@ macro_rules! impl_route_handler {
             }
         }
 
-        impl<C, $($argument,)+ O, HandlerError, F, Fut> RouteHandler<C>
+        impl<$($argument,)+ O, HandlerError, F, Fut> RouteHandler
             for TypedRouteHandler<
                 ($($argument,)+),
                 (O, HandlerError),
@@ -445,8 +441,7 @@ macro_rules! impl_route_handler {
                 PreserveRouteHeaders,
             >
         where
-            C: Codec,
-            $($argument: FromRouteMessage<C> + Send + Sync + 'static,)+
+            $($argument: FromRouteMessage + Send + Sync + 'static,)+
             O: Serialize + Send + Sync + 'static,
             HandlerError: std::fmt::Display + Send + Sync + 'static,
             F: Fn($($argument),+) -> Fut + Send + Sync + 'static,
@@ -455,20 +450,21 @@ macro_rules! impl_route_handler {
             fn call<'a>(
                 &'a self,
                 message: RouteMessage,
-                codec: &'a C,
+                decoder: &'a dyn RouteSource,
+                encoder: &'a dyn RouteTarget,
             ) -> BoxFuture<'a, Result<RouteMessage, RouteError>> {
                 Box::pin(async move {
                     let output = (self.handler)(
-                        $($argument::from_message(&message, codec)?,)+
+                        $($argument::from_message(&message, decoder)?,)+
                     )
                     .await
                     .map_err(RouteError::handler)?;
-                    encode_handler_output(&output, message, codec)
+                    encode_handler_output(&output, message, encoder)
                 })
             }
         }
 
-        impl<C, $($argument,)+ O, HandlerError, F, Fut> RouteHandler<C>
+        impl<$($argument,)+ O, HandlerError, F, Fut> RouteHandler
             for TypedRouteHandler<
                 ($($argument,)+),
                 (O, HandlerError),
@@ -476,8 +472,7 @@ macro_rules! impl_route_handler {
                 ReplaceRouteHeaders,
             >
         where
-            C: Codec,
-            $($argument: FromRouteMessage<C> + Send + Sync + 'static,)+
+            $($argument: FromRouteMessage + Send + Sync + 'static,)+
             O: Serialize + Send + Sync + 'static,
             HandlerError: std::fmt::Display + Send + Sync + 'static,
             F: Fn($($argument),+) -> Fut + Send + Sync + 'static,
@@ -486,16 +481,17 @@ macro_rules! impl_route_handler {
             fn call<'a>(
                 &'a self,
                 mut message: RouteMessage,
-                codec: &'a C,
+                decoder: &'a dyn RouteSource,
+                encoder: &'a dyn RouteTarget,
             ) -> BoxFuture<'a, Result<RouteMessage, RouteError>> {
                 Box::pin(async move {
                     let (headers, output) = (self.handler)(
-                        $($argument::from_message(&message, codec)?,)+
+                        $($argument::from_message(&message, decoder)?,)+
                     )
                     .await
                     .map_err(RouteError::handler)?;
                     message.headers = headers.0;
-                    encode_handler_output(&output, message, codec)
+                    encode_handler_output(&output, message, encoder)
                 })
             }
         }
@@ -507,38 +503,37 @@ impl_route_handler!(A, B);
 impl_route_handler!(A, B, D);
 impl_route_handler!(A, B, D, E);
 
-pub trait FromRouteMessage<C: Codec>: Sized {
-    fn from_message(message: &RouteMessage, codec: &C) -> Result<Self, BusError>;
+pub trait FromRouteMessage: Sized {
+    fn from_message(message: &RouteMessage, decoder: &dyn RouteSource) -> Result<Self, BusError>;
 }
 
-impl<T, C> FromRouteMessage<C> for T
+impl<T> FromRouteMessage for T
 where
     T: DeserializeOwned,
-    C: Codec,
 {
-    fn from_message(message: &RouteMessage, codec: &C) -> Result<Self, BusError> {
-        codec.decode(&message.payload)
+    fn from_message(message: &RouteMessage, decoder: &dyn RouteSource) -> Result<Self, BusError> {
+        let value = decoder.decode(message)?;
+        T::deserialize(value).map_err(|error| BusError::Serialization(error.to_string()))
     }
 }
 
-impl<C: Codec> FromRouteMessage<C> for RouteMessage {
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+impl FromRouteMessage for RouteMessage {
+    fn from_message(message: &RouteMessage, _decoder: &dyn RouteSource) -> Result<Self, BusError> {
         Ok(message.clone())
     }
 }
 
-impl<C: Codec> FromRouteMessage<C> for RouteHeaders {
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+impl FromRouteMessage for RouteHeaders {
+    fn from_message(message: &RouteMessage, _decoder: &dyn RouteSource) -> Result<Self, BusError> {
         Ok(Self(message.headers.clone()))
     }
 }
 
-impl<T, C> FromRouteMessage<C> for RouteHeader<T>
+impl<T> FromRouteMessage for RouteHeader<T>
 where
     T: FromRouteHeader,
-    C: Codec,
 {
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+    fn from_message(message: &RouteMessage, _decoder: &dyn RouteSource) -> Result<Self, BusError> {
         let value = message
             .headers
             .get(T::NAME)
@@ -547,8 +542,8 @@ where
     }
 }
 
-impl<C: Codec> FromRouteMessage<C> for RoutePayload {
-    fn from_message(message: &RouteMessage, _codec: &C) -> Result<Self, BusError> {
+impl FromRouteMessage for RoutePayload {
+    fn from_message(message: &RouteMessage, _decoder: &dyn RouteSource) -> Result<Self, BusError> {
         Ok(Self(message.payload.clone()))
     }
 }
@@ -556,6 +551,7 @@ impl<C: Codec> FromRouteMessage<C> for RoutePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::{Codec, JsonCodec};
     use futures::stream;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
@@ -567,8 +563,12 @@ mod tests {
     }
 
     impl RouteSource for CustomSource {
-        fn into_stream(self: Box<Self>) -> LocalBoxFuture<'static, Result<RouteStream, BusError>> {
-            let message = self.message;
+        fn decode(&self, message: &RouteMessage) -> Result<Value, BusError> {
+            JsonCodec.decode(&message.payload)
+        }
+
+        fn open(&mut self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>> {
+            let message = self.message.clone();
             Box::pin(
                 async move { Ok(Box::pin(stream::once(async move { message })) as RouteStream) },
             )
@@ -580,6 +580,12 @@ mod tests {
     }
 
     impl RouteTarget for CustomTarget {
+        fn encode(&self, value: &Value, message: &mut RouteMessage) -> Result<(), BusError> {
+            message.payload = JsonCodec.encode(value)?;
+            crate::codec::set_content_type(&mut message.headers, "application/json");
+            Ok(())
+        }
+
         fn deliver(&self, output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
             Box::pin(async move {
                 self.outputs
@@ -612,6 +618,12 @@ mod tests {
     struct FailingTarget;
 
     impl RouteTarget for FailingTarget {
+        fn encode(&self, value: &Value, message: &mut RouteMessage) -> Result<(), BusError> {
+            message.payload = JsonCodec.encode(value)?;
+            crate::codec::set_content_type(&mut message.headers, "application/json");
+            Ok(())
+        }
+
         fn deliver(&self, _output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>> {
             Box::pin(async { Err(BusError::Connection("downstream unavailable".into())) })
         }

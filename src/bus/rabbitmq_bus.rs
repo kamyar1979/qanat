@@ -103,6 +103,10 @@ impl<C: Codec + 'static> ExternalBus for RabbitMqBus<C> {
         &self.codec
     }
 
+    fn supports_content_type_headers(&self) -> bool {
+        true
+    }
+
     fn publish_bytes<'a>(
         &'a self,
         subject: &'a str,
@@ -213,6 +217,10 @@ fn headers_to_properties(headers: Option<HashMap<String, String>>) -> BasicPrope
         return BasicProperties::default();
     };
 
+    let mut properties = BasicProperties::default();
+    if let Some(content_type) = crate::codec::content_type(&headers) {
+        properties = properties.with_content_type(content_type.into());
+    }
     let mut table = FieldTable::default();
     for (key, value) in headers {
         table.insert(
@@ -221,24 +229,32 @@ fn headers_to_properties(headers: Option<HashMap<String, String>>) -> BasicPrope
         );
     }
 
-    BasicProperties::default().with_headers(table)
+    properties.with_headers(table)
 }
 
 fn properties_to_headers(properties: &BasicProperties) -> Option<HashMap<String, String>> {
-    let table = properties.headers().as_ref()?;
-    Some(
-        table
-            .into_iter()
-            .filter_map(|(key, value)| {
-                value.as_long_string().map(|value| {
-                    (
-                        key.to_string(),
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
+    let mut headers: HashMap<String, String> = properties
+        .headers()
+        .as_ref()
+        .into_iter()
+        .flat_map(|table| table.into_iter())
+        .filter_map(|(key, value)| {
+            value.as_long_string().map(|value| {
+                (
+                    key.to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
             })
-            .collect(),
-    )
+        })
+        .collect();
+    if let Some(content_type) = properties.content_type().as_ref() {
+        crate::codec::set_content_type(&mut headers, content_type.as_str());
+    }
+    if headers.is_empty() && properties.headers().is_none() {
+        None
+    } else {
+        Some(headers)
+    }
 }
 
 fn delivery_to_raw(delivery: lapin::message::Delivery, id: u64) -> RawMessage {
@@ -309,6 +325,26 @@ mod tests {
         let properties = headers_to_properties(Some(headers.clone()));
 
         assert_eq!(properties_to_headers(&properties), Some(headers));
+    }
+
+    #[test]
+    fn native_content_type_is_mapped_without_application_headers() {
+        let properties = BasicProperties::default().with_content_type("application/cbor".into());
+        assert_eq!(
+            properties_to_headers(&properties).unwrap()["content-type"],
+            "application/cbor"
+        );
+        let properties = headers_to_properties(Some(HashMap::from([(
+            "Content-Type".into(),
+            "application/msgpack".into(),
+        )])));
+        assert_eq!(
+            properties.content_type().as_ref().unwrap().as_str(),
+            "application/msgpack"
+        );
+        let headers = properties_to_headers(&properties).unwrap();
+        assert_eq!(headers["content-type"], "application/msgpack");
+        assert!(!headers.contains_key("Content-Type"));
     }
 
     async fn try_bus() -> Option<RabbitMqBus<JsonCodec>> {

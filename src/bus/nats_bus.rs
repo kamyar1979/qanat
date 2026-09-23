@@ -113,6 +113,10 @@ impl<C: Codec + 'static> ExternalBus for NatsBus<C> {
         &self.codec
     }
 
+    fn supports_content_type_headers(&self) -> bool {
+        true
+    }
+
     fn publish_bytes<'a>(
         &'a self,
         subject: &'a str,
