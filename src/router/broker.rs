@@ -382,7 +382,7 @@ where
                         .flatten(),
                 )
                 .map_err(ProxyError::from)?;
-            return Err(ProxyError::Remote(failure));
+            return Err(ProxyError::Remote(Box::new(failure)));
         }
 
         let reply_content_type = reply

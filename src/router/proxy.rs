@@ -10,7 +10,7 @@ use crate::router::RouteFailure;
 
 #[derive(Debug)]
 pub enum ProxyError {
-    Remote(RouteFailure),
+    Remote(Box<RouteFailure>),
     Timeout {
         correlation_id: String,
         timeout: Duration,
@@ -71,4 +71,14 @@ pub trait Proxy: Send + Sync {
     where
         I: Serialize + Sync,
         O: DeserializeOwned;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyError;
+
+    #[test]
+    fn proxy_error_stays_small() {
+        assert!(std::mem::size_of::<ProxyError>() <= 128);
+    }
 }

@@ -494,7 +494,7 @@ for requests and replies, which must match the service's endpoints.
 
 `BrokerProxy::call` follows Rust's `Result` model and returns `ProxyError`:
 
-- `ProxyError::Remote` contains the callee's structured `RouteFailure`.
+- `ProxyError::Remote` contains the callee's structured `Box<RouteFailure>`, keeping the error enum small without dynamic dispatch.
 - `ProxyError::Timeout` contains the correlation ID and configured deadline.
 - `ProxyError::Transport` wraps bus, connection, and codec failures.
 - `ProxyError::RuntimeStopped` reports failure of the local reply dispatcher.
