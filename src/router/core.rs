@@ -186,7 +186,7 @@ pub trait RouteTarget: Send + Sync + 'static {
 struct RouteBinding {
     source: Option<Box<dyn RouteSource>>,
     handler: Arc<dyn RouteHandler>,
-    target: Arc<dyn RouteTarget>,
+    target: Option<Arc<dyn RouteTarget>>,
     error_target: Option<Arc<dyn RouteTarget>>,
 }
 
@@ -232,11 +232,18 @@ impl Router {
                 .ok_or_else(|| BusError::Internal("route is already installed".into()))?;
             let mut subscription = source.open().await?;
             let handler = Arc::clone(&binding.handler);
-            let target = Arc::clone(&binding.target);
+            let target = binding.target.clone();
             let error_target = binding.error_target.clone();
 
             self.tasks.push(tokio::spawn(async move {
                 while let Some(message) = subscription.next().await {
+                    let Some(target) = target.as_ref() else {
+                        let original = message.clone();
+                        if let Err(error) = handler.consume(message, source.as_ref()).await {
+                            deliver_failure(error_target.as_ref(), original, error, None).await;
+                        }
+                        continue;
+                    };
                     if !target.accepts(&message) {
                         continue;
                     }
@@ -319,6 +326,26 @@ pub struct RouteFrom<Args> {
 }
 
 impl<Args> RouteFrom<Args> {
+    /// Register a terminal consumer with no success target.
+    ///
+    /// Transport-neutral: accepts any RouteSource, including broker, HTTP,
+    /// and externally implemented sources. Extraction uses the source decoder.
+    ///
+    /// The handler is awaited for each message; successful output is discarded
+    /// without serialization. Prefer handlers returning Result<(), E>.
+    /// Decoding and handler failures are sent to errors_to when configured,
+    /// otherwise logged. This does not change source acknowledgement semantics
+    /// or spawn a detached task for each message.
+    pub fn consume(mut self) -> Router {
+        self.router.bindings.push(RouteBinding {
+            source: Some(self.source),
+            handler: self.handler,
+            target: None,
+            error_target: self.error_target,
+        });
+        self.router
+    }
+
     pub fn to<T>(mut self, target: T) -> Router
     where
         T: RouteTarget,
@@ -326,7 +353,7 @@ impl<Args> RouteFrom<Args> {
         self.router.bindings.push(RouteBinding {
             source: Some(self.source),
             handler: self.handler,
-            target: Arc::new(target),
+            target: Some(Arc::new(target)),
             error_target: self.error_target,
         });
         self.router
@@ -334,6 +361,22 @@ impl<Args> RouteFrom<Args> {
 }
 
 pub trait RouteHandler: Send + Sync {
+    /// Execute without encoding or delivering successful output.
+    /// Typed function handlers implement this automatically. Custom handlers
+    /// must override it to support terminal routes; existing call-only handlers
+    /// retain their previous behavior on routes with targets.
+    fn consume<'a>(
+        &'a self,
+        _message: RouteMessage,
+        _decoder: &'a dyn RouteSource,
+    ) -> BoxFuture<'a, Result<(), RouteError>> {
+        Box::pin(async {
+            Err(RouteError::handler(
+                "custom handler does not support consume",
+            ))
+        })
+    }
+
     fn call<'a>(
         &'a self,
         message: RouteMessage,
@@ -535,6 +578,19 @@ macro_rules! impl_route_handler {
             F: Fn($($argument),+) -> Fut + Send + Sync + 'static,
             Fut: Future<Output = Result<O, HandlerError>> + Send + 'static,
         {
+            fn consume<'a>(
+                &'a self,
+                message: RouteMessage,
+                decoder: &'a dyn RouteSource,
+            ) -> BoxFuture<'a, Result<(), RouteError>> {
+                Box::pin(async move {
+                    (self.handler)(
+                        $($argument::from_message(&message, decoder)?,)+
+                    ).await.map_err(RouteError::handler)?;
+                    Ok(())
+                })
+            }
+
             fn call<'a>(
                 &'a self,
                 message: RouteMessage,
@@ -566,6 +622,19 @@ macro_rules! impl_route_handler {
             F: Fn($($argument),+) -> Fut + Send + Sync + 'static,
             Fut: Future<Output = Result<(RouteHeaders, O), HandlerError>> + Send + 'static,
         {
+            fn consume<'a>(
+                &'a self,
+                message: RouteMessage,
+                decoder: &'a dyn RouteSource,
+            ) -> BoxFuture<'a, Result<(), RouteError>> {
+                Box::pin(async move {
+                    (self.handler)(
+                        $($argument::from_message(&message, decoder)?,)+
+                    ).await.map_err(RouteError::handler)?;
+                    Ok(())
+                })
+            }
+
             fn call<'a>(
                 &'a self,
                 mut message: RouteMessage,
@@ -745,6 +814,90 @@ mod tests {
             assert!(!entry.contains("secret-body"));
             assert!(!entry.contains("secret-header"));
         }
+    }
+
+    #[tokio::test]
+    async fn consume_runs_without_success_target_or_output_serialization() {
+        struct Unserializable;
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                panic!("terminal output must not be serialized");
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let mut router = Router::new()
+            .bind(move |input: Input| {
+                observed.fetch_add(input.value as usize, Ordering::SeqCst);
+                async { Ok::<_, String>(Unserializable) }
+            })
+            .from(CustomSource {
+                message: RouteMessage::new("input", br#"{"value":7}"#.as_slice()),
+            })
+            .consume();
+        assert_eq!(router.route_count(), 1);
+        assert!(router.bindings[0].target.is_none());
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+    }
+
+    #[tokio::test]
+    async fn consume_routes_handler_and_decode_errors_with_original_message() {
+        for payload in [br#"{"value":7}"#.as_slice(), b"invalid-json".as_slice()] {
+            let (outputs, mut receiver) = mpsc::channel(2);
+            let mut original = RouteMessage::new("input", payload);
+            original
+                .headers
+                .insert("correlation-id".into(), "request-42".into());
+            let mut router = Router::new()
+                .bind(|_: Input| async { Err::<(), _>("enforcement failed") })
+                .errors_to(CustomTarget { outputs })
+                .from(CustomSource {
+                    message: original.clone(),
+                })
+                .consume();
+            router.install().await.unwrap();
+            for task in router.tasks.drain(..) {
+                task.await.unwrap();
+            }
+            let message = receiver.try_recv().unwrap();
+            let failure: RouteFailure = JsonCodec.decode(&message.payload).unwrap();
+            assert_eq!(failure.error.stage, RouteErrorStage::Handler);
+            assert_eq!(failure.original.payload, original.payload.to_vec());
+            assert_eq!(failure.original.headers, original.headers);
+            assert_eq!(message.headers[ROUTE_FAILURE_HEADER], "true");
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn consume_supports_unit_and_replaced_headers_without_success_messages() {
+        let (outputs, mut receiver) = mpsc::channel(2);
+        let mut router = Router::new()
+            .bind(|_: Input| async { Ok::<(), String>(()) })
+            .errors_to(CustomTarget {
+                outputs: outputs.clone(),
+            })
+            .from(CustomSource {
+                message: RouteMessage::new("input", br#"{"value":1}"#.as_slice()),
+            })
+            .consume()
+            .bind(|_: Input| async {
+                Ok::<(RouteHeaders, ()), String>((RouteHeaders::default(), ()))
+            })
+            .errors_to(CustomTarget { outputs })
+            .from(CustomSource {
+                message: RouteMessage::new("input", br#"{"value":2}"#.as_slice()),
+            })
+            .consume();
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+        assert!(receiver.try_recv().is_err());
     }
 
     struct CustomSource {

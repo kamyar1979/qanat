@@ -493,6 +493,45 @@ mod source_impl {
         }
 
         #[tokio::test]
+        async fn http_source_supports_terminal_consumer_and_error_route() {
+            let source = HttpSource::post("/orders");
+            let http = HttpRouter::new().source(&source).into_router();
+            let (outputs, mut output_rx) = mpsc::channel(1);
+            let mut routes = Router::new()
+                .bind(|order: CreateOrder| async move {
+                    assert_eq!(order.sku, "ABC-123");
+                    Err::<(), _>("policy rejected")
+                })
+                .errors_to(CaptureTarget { outputs })
+                .from(source)
+                .consume();
+            routes.install().await.unwrap();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/orders")
+                .header("content-type", "application/json")
+                .header("x-request-id", "request-42")
+                .body(Body::from(r#"{"sku":"ABC-123"}"#))
+                .unwrap();
+            let response = http.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(1), output_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let failure: crate::router::RouteFailure = JsonCodec.decode(&output.payload).unwrap();
+            assert_eq!(
+                failure
+                    .original
+                    .headers
+                    .get("x-request-id")
+                    .map(String::as_str),
+                Some("request-42")
+            );
+            assert_eq!(failure.error.stage, crate::router::RouteErrorStage::Handler);
+        }
+
+        #[tokio::test]
         async fn http_source_feeds_the_neutral_router() {
             let source = HttpSource::post("/orders");
             let http = HttpRouter::new().source(&source).into_router();

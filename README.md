@@ -379,6 +379,47 @@ and returns HTTP `503` when its route receiver is no longer available.
 `RouteSource` and `RouteTarget` are public traits. Additional transports such as
 gRPC or WebSocket can integrate without changing `Router`.
 
+## Terminal Consumers (No Success Target)
+
+Use `.consume()` when the handler performs the work itself, such as calling a
+device SDK, and no success response or downstream message is needed:
+
+```rust,ignore
+async fn enforce(event: Event) -> Result<(), EnforcementError> {
+    // Await the SDK operation and propagate failures.
+    apply_policy(event).await
+}
+
+let router = Router::new()
+    .bind(enforce)
+    .errors_to(BrokerTarget::from_shared(bus.clone(), "pcef.enforcement.error"))
+    .from(BrokerSource::from_shared(
+        bus,
+        "pcef.enforcement.command",
+        "pcef-enforcement-workers",
+    ))
+    .consume();
+```
+
+Install this router normally. Successful outputs are discarded without
+serialization; no success target, output codec, or dummy target is required.
+Prefer `Result<(), E>` for these handlers. Decoding and handler failures use
+the existing `errors_to` route with the original message. Without an error
+target, failures are logged.
+
+This API is transport-neutral: `.from(...)` accepts any `RouteSource`, including
+`BrokerSource`, `HttpSource` (with the `axum` feature), and external source
+implementations. Typed input is decoded by the selected source, not by a
+broker-specific codec. For HTTP, register the source on `HttpRouter` as usual;
+the HTTP response remains `202 Accepted` after enqueueing, not confirmation of
+handler completion. Handler failures go to `errors_to`, not the HTTP caller.
+
+This is one-way processing, not a detached task per message: the consumer awaits
+each handler before processing the next message on that binding. It does not
+change source acknowledgement/retry behavior or add durability guarantees.
+Custom implementations of `RouteHandler` must implement its `consume` method
+to opt in; typed function handlers support it automatically.
+
 ## Error Routing
 
 All bound handlers return `Result`. Add `errors_to` to send handler, codec, or

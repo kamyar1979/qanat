@@ -1172,6 +1172,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broker_source_supports_terminal_consumer() {
+        let bus = LoopbackBus::default();
+        let input_bus = bus.clone();
+        let (handled, mut received) = mpsc::channel(1);
+        let mut router = crate::router::Router::new()
+            .bind(move |message: TestMessage| {
+                let handled = handled.clone();
+                async move {
+                    handled.send(message.id).await.unwrap();
+                    Ok::<(), String>(())
+                }
+            })
+            .from(BrokerSource::new(bus, "orders.created", "orders.in"))
+            .consume();
+        router.install().await.unwrap();
+        input_bus
+            .dispatch(
+                "orders.created",
+                raw_message(
+                    "orders.created",
+                    crate::codec::JsonCodec
+                        .encode(&TestMessage { id: 41 })
+                        .unwrap(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received.recv())
+                .await
+                .unwrap(),
+            Some(41)
+        );
+    }
+
+    #[tokio::test]
     async fn neutral_router_sends_broker_input_to_http_target() {
         let bus = LoopbackBus::default();
         let input_bus = bus.clone();
