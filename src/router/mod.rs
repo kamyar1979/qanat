@@ -21,9 +21,9 @@ pub use config::{
     RouteManifest,
 };
 pub use core::{
-    Bind, FailedRouteMessage, FromRouteHeader, FromRouteMessage, IntoRouteHandler, PayloadValue,
-    ROUTE_FAILURE_HEADER, RouteError, RouteErrorStage, RouteFailure, RouteFrom, RouteHandler,
-    RouteHeader, RouteHeaders, RouteMessage, RoutePayload, RouteSource, RouteStream, RouteTarget,
-    Router, TypedRouteHandler,
+    Bind, FailedRouteMessage, FromRouteHeader, FromRouteMessage, HTTP_STATUS_HEADER,
+    IntoRouteHandler, PayloadValue, ROUTE_FAILURE_HEADER, RouteError, RouteErrorStage,
+    RouteFailure, RouteFrom, RouteHandler, RouteHeader, RouteHeaders, RouteMessage, RoutePayload,
+    RouteSource, RouteStream, RouteTarget, Router, TypedRouteHandler,
 };
 pub use proxy::{Proxy, ProxyError};

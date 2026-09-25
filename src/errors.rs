@@ -29,6 +29,9 @@ pub enum BusError {
 pub enum BackendError {
     Other(String),
 
+    /// An HTTP target returned a non-success response.
+    Http(Box<crate::http::HttpResponse>),
+
     #[cfg(feature = "nats")]
     NatsPublish(async_nats::PublishError),
 
@@ -49,6 +52,9 @@ impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BackendError::Other(err) => write!(f, "{}", err),
+            BackendError::Http(response) => {
+                write!(f, "HTTP target returned status {}", response.status)
+            }
             #[cfg(feature = "nats")]
             BackendError::NatsPublish(err) => write!(f, "NATS publish error: {}", err),
             #[cfg(feature = "nats")]
@@ -66,7 +72,7 @@ impl fmt::Display for BackendError {
 impl Error for BackendError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            BackendError::Other(_) => None,
+            BackendError::Other(_) | BackendError::Http(_) => None,
             #[cfg(feature = "nats")]
             BackendError::NatsPublish(err) => Some(err),
             #[cfg(feature = "nats")]

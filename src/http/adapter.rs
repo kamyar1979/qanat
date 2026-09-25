@@ -901,10 +901,7 @@ mod target_impl {
             if response.is_success() {
                 Ok(response)
             } else {
-                Err(BusError::Backend(BackendError::Other(format!(
-                    "HTTP target '{}' returned status {}",
-                    self.url, response.status
-                ))))
+                Err(BusError::Backend(BackendError::Http(Box::new(response))))
             }
         }
     }

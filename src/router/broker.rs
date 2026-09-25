@@ -1288,7 +1288,13 @@ mod tests {
         let bus = LoopbackBus::default();
         let input_bus = bus.clone();
         let failed_target = HttpTarget::post("http://orders.test/events", |_| async move {
-            Ok(crate::http::HttpResponse::new(503))
+            let mut response = crate::http::HttpResponse::new(503);
+            response.body = bytes::Bytes::from_static(b"temporarily unavailable");
+            response
+                .headers
+                .insert("Content-Type".into(), "text/plain".into());
+            response.headers.insert("Retry-After".into(), "60".into());
+            Ok(response)
         });
         let (error_requests, mut error_rx) = mpsc::channel(1);
         let error_target = HttpTarget::post("http://orders.test/errors", move |request| {
@@ -1325,15 +1331,76 @@ mod tests {
             .await
             .expect("HTTP error target was not invoked")
             .expect("HTTP error target channel closed");
-        let failure: crate::router::RouteFailure =
-            crate::codec::JsonCodec.decode(&request.body).unwrap();
-
         assert_eq!(request.url, "http://orders.test/errors");
-        assert_eq!(
-            failure.error.stage,
-            crate::router::RouteErrorStage::Delivery
-        );
-        assert!(failure.error.message.contains("status 503"));
-        assert_eq!(failure.original.address, "orders.created");
+        assert_eq!(request.body.as_ref(), b"temporarily unavailable");
+        assert_eq!(request.headers[crate::router::HTTP_STATUS_HEADER], "503");
+        assert_eq!(request.headers["content-type"], "text/plain");
+        assert_eq!(request.headers["retry-after"], "60");
+    }
+
+    #[tokio::test]
+    async fn failed_http_response_reaches_broker_without_reencoding() {
+        let bus = LoopbackBus::default();
+        let mut errors = bus.subscribe("orders.errors").await.unwrap();
+        let target = HttpTarget::post("http://orders.test/events", |_| async {
+            let mut response = crate::http::HttpResponse::new(422);
+            response.body = bytes::Bytes::from_static(b"\xff\x00invalid");
+            response.headers = HashMap::from([
+                ("Content-Type".into(), "application/octet-stream".into()),
+                ("Set-Cookie".into(), "private=value".into()),
+                ("Authorization".into(), "private".into()),
+                ("Connection".into(), "X-Hop".into()),
+                ("X-Hop".into(), "private".into()),
+                ("Content-Length".into(), "9".into()),
+                ("correlation_id".into(), "forged".into()),
+                ("qanat-http-status".into(), "200".into()),
+            ]);
+            Ok(response)
+        });
+        let mut router = crate::router::Router::new()
+            .bind(|message: TestMessage| async move {
+                Ok::<_, std::convert::Infallible>(TestReply { id: message.id })
+            })
+            .errors_to(BrokerTarget::new(bus.clone(), "orders.errors"))
+            .from(BrokerSource::new(
+                bus.clone(),
+                "orders.created",
+                "orders.in",
+            ))
+            .to(target);
+        router.install().await.unwrap();
+        bus.dispatch(
+            "orders.created",
+            raw_message(
+                "orders.created",
+                crate::codec::JsonCodec
+                    .encode(&TestMessage { id: 41 })
+                    .unwrap(),
+                Some(HashMap::from([
+                    (CORRELATION_ID_HEADER.into(), "request-41".into()),
+                    ("authorization".into(), "request-secret".into()),
+                ])),
+            ),
+        )
+        .await
+        .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(1), errors.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.payload.as_ref(), b"\xff\x00invalid");
+        let headers = message.envelope.headers.unwrap();
+        assert_eq!(headers[crate::router::HTTP_STATUS_HEADER], "422");
+        assert_eq!(headers[CORRELATION_ID_HEADER], "request-41");
+        assert_eq!(headers["content-type"], "application/octet-stream");
+        for excluded in [
+            "authorization",
+            "set-cookie",
+            "connection",
+            "x-hop",
+            "content-length",
+        ] {
+            assert!(!headers.contains_key(excluded));
+        }
     }
 }

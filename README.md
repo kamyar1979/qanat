@@ -408,10 +408,24 @@ The error target can be any `RouteTarget`, including `BrokerTarget`,
 containing a transport-neutral `RouteError` and the original address, headers,
 metadata, and payload. Routing headers pass through to the error target.
 
+For a non-2xx HTTP target response, the error target instead receives the original
+response body unchanged, response headers, and `qanat-http-status` containing the
+HTTP status code. This bypasses the error target's codec, retaining the response
+content type. The original request's correlation ID and broker reply destination
+are preserved. Credentials, cookies, hop-by-hop headers (including those named by
+`Connection`), content length, and untrusted Qanat routing headers are excluded.
+Connection failures without an HTTP response still use `RouteFailure`.
+
 For an HTTP source, `202 Accepted` means the request was admitted for
 asynchronous processing. A later handler or delivery failure can still be sent
 to the configured broker or HTTP error target. Failure of the error target
-itself is terminal and is not routed recursively.
+itself is logged and is not routed recursively. Missing error targets, rejected
+error messages, encoding failures, and error-target delivery failures emit `tracing`
+error events with the original error stage, code, message ID, and error description.
+Background handlers continue processing subsequent messages. Qanat does not install
+a global logging subscriber; configure one in the application to display these logs
+(for example, `tracing-subscriber`). Payloads and header maps are not logged; error
+descriptions supplied by application handlers should not contain secrets.
 
 ## Request/Reply Proxy
 

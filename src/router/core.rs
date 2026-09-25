@@ -9,11 +9,12 @@ use futures::future::{BoxFuture, LocalBoxFuture};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::errors::BusError;
+use crate::errors::{BackendError, BusError};
 pub use serde_value::Value as PayloadValue;
 use serde_value::Value;
 
 pub const ROUTE_FAILURE_HEADER: &str = "qanat-route-failure";
+pub const HTTP_STATUS_HEADER: &str = "qanat-http-status";
 
 #[derive(Clone, Debug)]
 pub struct RouteMessage {
@@ -246,16 +247,24 @@ impl Router {
                     {
                         Ok(output) => {
                             if let Err(error) = target.deliver(output).await {
+                                let route_error = RouteError::delivery(&error);
+                                let response = match error {
+                                    BusError::Backend(BackendError::Http(response)) => {
+                                        Some(*response)
+                                    }
+                                    _ => None,
+                                };
                                 deliver_failure(
                                     error_target.as_ref(),
                                     original,
-                                    RouteError::delivery(error),
+                                    route_error,
+                                    response,
                                 )
                                 .await;
                             }
                         }
                         Err(error) => {
-                            deliver_failure(error_target.as_ref(), original, error).await;
+                            deliver_failure(error_target.as_ref(), original, error, None).await;
                         }
                     }
                 }
@@ -368,29 +377,108 @@ async fn deliver_failure(
     target: Option<&Arc<dyn RouteTarget>>,
     original: RouteMessage,
     error: RouteError,
+    response: Option<crate::http::HttpResponse>,
 ) {
-    let Some(target) = target else {
-        return;
-    };
-    let mut message = original.clone();
-    let failure = RouteFailure {
-        error,
-        original: original.into(),
-    };
-    let Ok(value) = serde_value::to_value(&failure) else {
-        return;
-    };
-    message.timestamp = std::time::Instant::now();
-    if target.encode(&value, &mut message).is_err() {
-        return;
-    }
-    message
-        .headers
-        .insert(ROUTE_FAILURE_HEADER.to_string(), "true".to_string());
+    let span = tracing::error_span!(
+        "route_failure",
+        message_id = original.id,
+        stage = ?error.stage,
+        code = %error.code,
+        original_error = %error.message,
+    );
+    // Keep context across awaits without holding an entered span on the executor.
+    use tracing::Instrument;
+    async move {
+        let Some(target) = target else {
+            tracing::error!("route failed with no error target configured");
+            return;
+        };
+        let mut message = original.clone();
+        if let Some(response) = response {
+            message.payload = response.body;
+            message.headers = forwarded_http_error_headers(response.headers);
+            if let Some(correlation_id) = original.headers.get(super::CORRELATION_ID_HEADER) {
+                message
+                    .headers
+                    .insert(super::CORRELATION_ID_HEADER.into(), correlation_id.clone());
+            }
+            // Dynamic broker replies still need the original reply destination.
+            if let Some(reply_to) = original.headers.get(super::REPLY_TO_HEADER) {
+                message
+                    .headers
+                    .insert(super::REPLY_TO_HEADER.into(), reply_to.clone());
+            }
+            message
+                .headers
+                .insert(HTTP_STATUS_HEADER.into(), response.status.to_string());
+        } else {
+            let failure = RouteFailure {
+                error,
+                original: original.into(),
+            };
+            let value = match serde_value::to_value(&failure) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to construct error-target payload");
+                    return;
+                }
+            };
+            if let Err(error) = target.encode(&value, &mut message) {
+                tracing::error!(error = %error, "failed to encode error-target payload");
+                return;
+            }
+        }
+        message.timestamp = std::time::Instant::now();
+        message
+            .headers
+            .insert(ROUTE_FAILURE_HEADER.to_string(), "true".to_string());
 
-    if target.accepts(&message) {
-        let _ = target.deliver(message).await;
+        if !target.accepts(&message) {
+            tracing::error!("error target rejected failure message");
+            return;
+        }
+        match target.deliver(message).await {
+            Ok(()) => tracing::debug!("failure delivered to error target"),
+            Err(error) => tracing::error!(error = %error, "error-target delivery failed"),
+        }
     }
+    .instrument(span)
+    .await;
+}
+
+fn forwarded_http_error_headers(headers: HashMap<String, String>) -> HashMap<String, String> {
+    let connection_headers: Vec<String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    headers
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.to_ascii_lowercase();
+            let excluded = matches!(
+                name.as_str(),
+                "connection"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "transfer-encoding"
+                    | "upgrade"
+                    | "content-length"
+                    | "host"
+                    | "authorization"
+                    | "cookie"
+                    | "set-cookie"
+            ) || name.starts_with("qanat-")
+                || name == super::CORRELATION_ID_HEADER
+                || name == super::REPLY_TO_HEADER
+                || connection_headers.contains(&name);
+            (!excluded).then_some((name, value))
+        })
+        .collect()
 }
 
 macro_rules! impl_route_handler {
@@ -557,6 +645,107 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct CapturedLogs(std::sync::mpsc::Sender<String>);
+
+    impl tracing::Subscriber for CapturedLogs {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    write!(&mut self.0, " {}={value:?}", field.name()).unwrap();
+                }
+            }
+            let mut visitor = Visitor(event.metadata().level().to_string());
+            event.record(&mut visitor);
+            self.0.send(visitor.0).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unhandled_and_secondary_failures_are_logged_without_recursion() {
+        use tracing::instrument::WithSubscriber;
+        let (sender, logs) = std::sync::mpsc::channel();
+        let captured = CapturedLogs(sender);
+        async move {
+            let original = || {
+                let mut message = RouteMessage::new("test", b"secret-body".as_slice());
+                message
+                    .headers
+                    .insert("authorization".into(), "secret-header".into());
+                message
+            };
+            deliver_failure(
+                None,
+                original(),
+                RouteError::handler("original failure"),
+                None,
+            )
+            .await;
+
+            let failed: Arc<dyn RouteTarget> = Arc::new(FailingTarget);
+            deliver_failure(
+                Some(&failed),
+                original(),
+                RouteError::handler("original failure"),
+                None,
+            )
+            .await;
+
+            let (outputs, mut receiver) = mpsc::channel(1);
+            let rejected: Arc<dyn RouteTarget> = Arc::new(RejectingTarget { outputs });
+            // A raw HTTP error bypasses encode, reaching the rejection check.
+            deliver_failure(
+                Some(&rejected),
+                original(),
+                RouteError::delivery("HTTP failure"),
+                Some(crate::http::HttpResponse::new(500)),
+            )
+            .await;
+            assert!(receiver.try_recv().is_err());
+
+            // The default encoder rejects structured failures.
+            deliver_failure(
+                Some(&rejected),
+                original(),
+                RouteError::handler("original failure"),
+                None,
+            )
+            .await;
+        }
+        .with_subscriber(captured)
+        .await;
+
+        let entries: Vec<_> = logs.try_iter().collect();
+        assert_eq!(entries.len(), 4);
+        for (entry, expected) in entries.iter().zip([
+            "no error target configured",
+            "error-target delivery failed",
+            "error target rejected",
+            "failed to encode error-target payload",
+        ]) {
+            assert!(entry.starts_with("ERROR"));
+            assert!(entry.contains(expected), "{entry}");
+            assert!(!entry.contains("secret-body"));
+            assert!(!entry.contains("secret-header"));
+        }
+    }
 
     struct CustomSource {
         message: RouteMessage,
