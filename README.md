@@ -458,6 +458,55 @@ change source acknowledgement/retry behavior or add durability guarantees.
 Custom implementations of `RouteHandler` must implement its `consume` method
 to opt in; typed function handlers support it automatically.
 
+## Asynchronous Partitioned Execution
+
+Use `.partition_by(...)` when messages sharing a resolved key must run
+sequentially while different keys may run concurrently. The resolver receives
+a decoded typed value and may perform asynchronous inventory or configuration
+lookups:
+
+```rust,ignore
+let router = Router::new()
+    .bind(enforce)
+    .partition_by(|command: EnforcementCommand| async move {
+        resolve_device_id(&command).await
+    })
+    .errors_to(BrokerTarget::from_shared(bus.clone(), "enforcement.error"))
+    .from(BrokerSource::from_shared(
+        bus,
+        "enforcement.command",
+        "enforcement-workers",
+    ))
+    .consume();
+```
+
+Partitioning is transport-neutral and covers handler execution, success/error
+delivery, and source settlement. A broker message therefore remains unsettled
+until its partitioned route job completes.
+
+By default each route owns a private partition domain. Related routes can share
+one process-local domain:
+
+```rust,ignore
+use qanat::router::Partitioner;
+
+let devices = Partitioner::with_capacity(64);
+let router = Router::new()
+    .bind(enforce_policy)
+    .partition_by_with(devices.clone(), resolve_policy_device)
+    .from(policy_source)
+    .consume()
+    .bind(enforce_provisioning)
+    .partition_by_with(devices, resolve_provisioning_device)
+    .from(provisioning_source)
+    .consume();
+```
+
+Each key uses a bounded Tokio channel. Idle workers are removed after 60
+seconds by default; `Partitioner::with_options` customizes capacity and idle
+timeout. This scheduler coordinates only routes inside one process. It does not
+provide distributed ownership across service instances.
+
 ## Error Routing
 
 All bound handlers return `Result`. Add `errors_to` to send handler, codec, or

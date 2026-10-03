@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use futures::StreamExt;
 use futures::future::{BoxFuture, LocalBoxFuture};
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, FuturesUnordered};
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::DeliveryDecision;
@@ -197,12 +198,193 @@ pub trait RouteTarget: Send + Sync + 'static {
     fn deliver(&self, output: RouteMessage) -> BoxFuture<'_, Result<(), BusError>>;
 }
 
+const DEFAULT_PARTITION_CAPACITY: usize = 64;
+const DEFAULT_PARTITION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+type PartitionTask = BoxFuture<'static, ()>;
+
+struct PartitionJob {
+    task: PartitionTask,
+    completion: tokio::sync::oneshot::Sender<()>,
+}
+
+struct PartitionerInner {
+    capacity: usize,
+    idle_timeout: Duration,
+    queues: tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<PartitionJob>>>,
+}
+
+/// A process-local keyed execution domain shared by one or more routes.
+///
+/// Each key has a bounded Tokio channel and one worker. Jobs for the same key
+/// run sequentially, while different keys can run concurrently. Clone and
+/// reuse a `Partitioner` to coordinate related routes in the same process.
+#[derive(Clone)]
+pub struct Partitioner {
+    inner: Arc<PartitionerInner>,
+}
+
+impl Partitioner {
+    pub fn new() -> Self {
+        Self::with_options(DEFAULT_PARTITION_CAPACITY, DEFAULT_PARTITION_IDLE_TIMEOUT)
+    }
+
+    /// Create a partitioner with bounded per-key queues and the default idle
+    /// worker timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_options(capacity, DEFAULT_PARTITION_IDLE_TIMEOUT)
+    }
+
+    /// Create a partitioner with explicit per-key queue capacity and idle
+    /// worker timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `capacity` is zero or `idle_timeout` is zero.
+    pub fn with_options(capacity: usize, idle_timeout: Duration) -> Self {
+        assert!(capacity > 0, "partition queue capacity must be nonzero");
+        assert!(
+            !idle_timeout.is_zero(),
+            "partition idle timeout must be nonzero"
+        );
+        Self {
+            inner: Arc::new(PartitionerInner {
+                capacity,
+                idle_timeout,
+                queues: tokio::sync::Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    async fn submit_task(
+        &self,
+        key: String,
+        task: PartitionTask,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+        let mut job = PartitionJob { task, completion };
+        loop {
+            let sender = {
+                let mut queues = self.inner.queues.lock().await;
+                if let Some(sender) = queues.get(&key) {
+                    sender.clone()
+                } else {
+                    let (sender, receiver) = tokio::sync::mpsc::channel(self.inner.capacity);
+                    queues.insert(key.clone(), sender.clone());
+                    spawn_partition_worker(Arc::downgrade(&self.inner), key.clone(), receiver);
+                    sender
+                }
+            };
+            match sender.send(job).await {
+                Ok(()) => return receiver,
+                Err(error) => job = error.0,
+            }
+        }
+    }
+}
+
+impl Default for Partitioner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn spawn_partition_worker(
+    inner: std::sync::Weak<PartitionerInner>,
+    key: String,
+    mut receiver: tokio::sync::mpsc::Receiver<PartitionJob>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let Some(shared) = inner.upgrade() else {
+                break;
+            };
+            match tokio::time::timeout(shared.idle_timeout, receiver.recv()).await {
+                Ok(Some(job)) => {
+                    let PartitionJob { task, completion } = job;
+                    if std::panic::AssertUnwindSafe(task)
+                        .catch_unwind()
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(partition_key = %key, "partition job panicked");
+                    }
+                    let _ = completion.send(());
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    let mut queues = shared.queues.lock().await;
+                    let should_remove = queues
+                        .get(&key)
+                        .is_some_and(|sender| sender.strong_count() == 1);
+                    if should_remove {
+                        queues.remove(&key);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+trait PartitionResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        message: &'a RouteMessage,
+        decoder: &'a dyn RouteSource,
+    ) -> BoxFuture<'a, Result<String, RouteError>>;
+}
+
+type PartitionResolverTypes<I, K, E, Fut> = fn(I) -> (K, E, Fut);
+
+struct TypedPartitionResolver<I, K, E, F, Fut> {
+    resolver: F,
+    _types: PhantomData<PartitionResolverTypes<I, K, E, Fut>>,
+}
+
+impl<I, K, E, F, Fut> PartitionResolver for TypedPartitionResolver<I, K, E, F, Fut>
+where
+    I: FromRouteMessage + Send + Sync + 'static,
+    K: Into<String> + Send + Sync + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
+    F: Fn(I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<K, E>> + Send + 'static,
+{
+    fn resolve<'a>(
+        &'a self,
+        message: &'a RouteMessage,
+        decoder: &'a dyn RouteSource,
+    ) -> BoxFuture<'a, Result<String, RouteError>> {
+        Box::pin(async move {
+            let input = I::from_message(message, decoder).map_err(RouteError::handler)?;
+            let key = (self.resolver)(input)
+                .await
+                .map_err(RouteError::handler)?
+                .into();
+            if key.is_empty() {
+                return Err(RouteError::handler("partition key must not be empty"));
+            }
+            Ok(key)
+        })
+    }
+}
+
+struct PartitionBinding {
+    partitioner: Partitioner,
+    resolver: Arc<dyn PartitionResolver>,
+}
+
 struct RouteBinding {
     source: Option<Box<dyn RouteSource>>,
     handler: Arc<dyn RouteHandler>,
     target: Option<Arc<dyn RouteTarget>>,
     error_target: Option<Arc<dyn RouteTarget>>,
     failure_decision: DeliveryDecision,
+    partition: Option<PartitionBinding>,
 }
 
 pub struct Router {
@@ -228,6 +410,7 @@ impl Router {
             handler: handler.into_handler(),
             error_target: None,
             failure_decision: DeliveryDecision::default(),
+            partition: None,
             _args: PhantomData,
         }
     }
@@ -247,74 +430,131 @@ impl Router {
                 .take()
                 .ok_or_else(|| BusError::Internal("route is already installed".into()))?;
             let mut subscription = source.open().await?;
+            let source: Arc<dyn RouteSource> = Arc::from(source);
             let handler = Arc::clone(&binding.handler);
             let target = binding.target.clone();
             let error_target = binding.error_target.clone();
             let failure_decision = binding.failure_decision;
+            let partition = binding.partition.take();
 
             self.tasks.push(tokio::spawn(async move {
-                while let Some(message) = subscription.next().await {
-                    let Some(target) = target.as_ref() else {
-                        let original = message.clone();
-                        match handler.consume(message, source.as_ref()).await {
-                            Ok(()) => {
-                                settle(source.as_ref(), &original, DeliveryDecision::Ack).await
-                            }
-                            Err(error) => {
-                                deliver_failure(
-                                    error_target.as_ref(),
-                                    original.clone(),
-                                    error,
-                                    None,
-                                )
-                                .await;
-                                settle(source.as_ref(), &original, failure_decision).await;
-                            }
-                        }
-                        continue;
-                    };
-                    if !target.accepts(&message) {
-                        let error = RouteError::delivery("target rejected the route message");
-                        deliver_failure(error_target.as_ref(), message.clone(), error, None).await;
-                        settle(source.as_ref(), &message, failure_decision).await;
-                        continue;
+                let Some(partition) = partition else {
+                    while let Some(message) = subscription.next().await {
+                        process_route_message(
+                            Arc::clone(&source),
+                            Arc::clone(&handler),
+                            target.clone(),
+                            error_target.clone(),
+                            failure_decision,
+                            message,
+                        )
+                        .await;
                     }
-                    let original = message.clone();
-                    match handler
-                        .call(message, source.as_ref(), target.as_ref())
-                        .await
-                    {
-                        Ok(output) => {
-                            if let Err(error) = target.deliver(output).await {
-                                let route_error = RouteError::delivery(&error);
-                                let response = match error {
-                                    BusError::Backend(BackendError::Http(response)) => {
-                                        Some(*response)
-                                    }
-                                    _ => None,
-                                };
-                                deliver_failure(
-                                    error_target.as_ref(),
-                                    original.clone(),
-                                    route_error,
-                                    response,
+                    return;
+                };
+
+                let mut pending = FuturesUnordered::new();
+                let mut source_open = true;
+                while source_open || !pending.is_empty() {
+                    tokio::select! {
+                        message = subscription.next(), if source_open => {
+                            let Some(message) = message else {
+                                source_open = false;
+                                continue;
+                            };
+                            let key = match partition.resolver.resolve(&message, source.as_ref()).await {
+                                Ok(key) => key,
+                                Err(error) => {
+                                    deliver_failure(
+                                        error_target.as_ref(),
+                                        message.clone(),
+                                        error,
+                                        None,
+                                    )
+                                    .await;
+                                    settle(source.as_ref(), &message, failure_decision).await;
+                                    continue;
+                                }
+                            };
+                            let job_source = Arc::clone(&source);
+                            let job_handler = Arc::clone(&handler);
+                            let job_target = target.clone();
+                            let job_error_target = error_target.clone();
+                            let task = Box::pin(async move {
+                                process_route_message(
+                                    job_source,
+                                    job_handler,
+                                    job_target,
+                                    job_error_target,
+                                    failure_decision,
+                                    message,
                                 )
                                 .await;
-                                settle(source.as_ref(), &original, failure_decision).await;
-                            } else {
-                                settle(source.as_ref(), &original, DeliveryDecision::Ack).await;
-                            }
+                            });
+                            pending.push(partition.partitioner.submit_task(key, task).await);
                         }
-                        Err(error) => {
-                            deliver_failure(error_target.as_ref(), original.clone(), error, None)
-                                .await;
-                            settle(source.as_ref(), &original, failure_decision).await;
-                        }
+                        Some(_) = pending.next(), if !pending.is_empty() => {}
                     }
                 }
             }));
         }
         Ok(())
+    }
+}
+
+async fn process_route_message(
+    source: Arc<dyn RouteSource>,
+    handler: Arc<dyn RouteHandler>,
+    target: Option<Arc<dyn RouteTarget>>,
+    error_target: Option<Arc<dyn RouteTarget>>,
+    failure_decision: DeliveryDecision,
+    message: RouteMessage,
+) {
+    let Some(target) = target.as_ref() else {
+        let original = message.clone();
+        match handler.consume(message, source.as_ref()).await {
+            Ok(()) => settle(source.as_ref(), &original, DeliveryDecision::Ack).await,
+            Err(error) => {
+                deliver_failure(error_target.as_ref(), original.clone(), error, None).await;
+                settle(source.as_ref(), &original, failure_decision).await;
+            }
+        }
+        return;
+    };
+    if !target.accepts(&message) {
+        let error = RouteError::delivery("target rejected the route message");
+        deliver_failure(error_target.as_ref(), message.clone(), error, None).await;
+        settle(source.as_ref(), &message, failure_decision).await;
+        return;
+    }
+    let original = message.clone();
+    match handler
+        .call(message, source.as_ref(), target.as_ref())
+        .await
+    {
+        Ok(output) => {
+            if let Err(error) = target.deliver(output).await {
+                let route_error = RouteError::delivery(&error);
+                let response = match error {
+                    BusError::Backend(BackendError::Http(response)) => Some(*response),
+                    _ => None,
+                };
+                deliver_failure(
+                    error_target.as_ref(),
+                    original.clone(),
+                    route_error,
+                    response,
+                )
+                .await;
+                settle(source.as_ref(), &original, failure_decision).await;
+            } else {
+                settle(source.as_ref(), &original, DeliveryDecision::Ack).await;
+            }
+        }
+        Err(error) => {
+            deliver_failure(error_target.as_ref(), original.clone(), error, None).await;
+            settle(source.as_ref(), &original, failure_decision).await;
+        }
     }
 }
 
@@ -341,6 +581,7 @@ pub struct Bind<Args> {
     handler: Arc<dyn RouteHandler>,
     error_target: Option<Arc<dyn RouteTarget>>,
     failure_decision: DeliveryDecision,
+    partition: Option<PartitionBinding>,
     _args: PhantomData<fn(Args)>,
 }
 
@@ -358,6 +599,49 @@ impl<Args> Bind<Args> {
         self
     }
 
+    /// Partition route execution by an asynchronously resolved key.
+    ///
+    /// This creates a partition domain private to this route. Jobs sharing a
+    /// key execute sequentially; different keys may execute concurrently.
+    /// Source settlement happens only after the complete partitioned route job
+    /// finishes.
+    pub fn partition_by<I, K, E, F, Fut>(self, resolver: F) -> Self
+    where
+        I: FromRouteMessage + Send + Sync + 'static,
+        K: Into<String> + Send + Sync + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<K, E>> + Send + 'static,
+    {
+        self.partition_by_with(Partitioner::new(), resolver)
+    }
+
+    /// Partition route execution using a shared process-local domain.
+    ///
+    /// Clone and pass the same `Partitioner` to related routes when they must
+    /// serialize work for the same key.
+    pub fn partition_by_with<I, K, E, F, Fut>(
+        mut self,
+        partitioner: Partitioner,
+        resolver: F,
+    ) -> Self
+    where
+        I: FromRouteMessage + Send + Sync + 'static,
+        K: Into<String> + Send + Sync + 'static,
+        E: std::fmt::Display + Send + Sync + 'static,
+        F: Fn(I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<K, E>> + Send + 'static,
+    {
+        self.partition = Some(PartitionBinding {
+            partitioner,
+            resolver: Arc::new(TypedPartitionResolver::<I, K, E, F, Fut> {
+                resolver,
+                _types: PhantomData,
+            }),
+        });
+        self
+    }
+
     pub fn from<S>(self, source: S) -> RouteFrom<Args>
     where
         S: RouteSource,
@@ -367,6 +651,7 @@ impl<Args> Bind<Args> {
             handler: self.handler,
             error_target: self.error_target,
             failure_decision: self.failure_decision,
+            partition: self.partition,
             source: Box::new(source),
             _args: PhantomData,
         }
@@ -378,6 +663,7 @@ pub struct RouteFrom<Args> {
     handler: Arc<dyn RouteHandler>,
     error_target: Option<Arc<dyn RouteTarget>>,
     failure_decision: DeliveryDecision,
+    partition: Option<PartitionBinding>,
     source: Box<dyn RouteSource>,
     _args: PhantomData<fn(Args)>,
 }
@@ -401,6 +687,7 @@ impl<Args> RouteFrom<Args> {
             target: None,
             error_target: self.error_target,
             failure_decision: self.failure_decision,
+            partition: self.partition,
         });
         self.router
     }
@@ -415,6 +702,7 @@ impl<Args> RouteFrom<Args> {
             target: Some(Arc::new(target)),
             error_target: self.error_target,
             failure_decision: self.failure_decision,
+            partition: self.partition,
         });
         self.router
     }
@@ -813,6 +1101,9 @@ mod tests {
         let (sender, logs) = std::sync::mpsc::channel();
         let captured = CapturedLogs(sender);
         async move {
+            // Other parallel tests may have populated tracing's global callsite
+            // cache before this task-local subscriber was installed.
+            tracing::callsite::rebuild_interest_cache();
             let original = || {
                 let mut message = RouteMessage::new("test", b"secret-body".as_slice());
                 message
@@ -977,6 +1268,21 @@ mod tests {
         }
     }
 
+    struct MultiSource {
+        messages: Vec<RouteMessage>,
+    }
+
+    impl RouteSource for MultiSource {
+        fn decode(&self, message: &RouteMessage) -> Result<Value, BusError> {
+            JsonCodec.decode(&message.payload)
+        }
+
+        fn open(&mut self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>> {
+            let messages = self.messages.clone();
+            Box::pin(async move { Ok(Box::pin(stream::iter(messages)) as RouteStream) })
+        }
+    }
+
     struct SettlingSource {
         message: RouteMessage,
         decisions: mpsc::UnboundedSender<DeliveryDecision>,
@@ -1065,6 +1371,12 @@ mod tests {
     #[derive(Deserialize)]
     struct Input {
         value: u64,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    struct PartitionInput {
+        key: String,
+        sequence: u64,
     }
 
     #[derive(Deserialize, Serialize)]
@@ -1168,6 +1480,228 @@ mod tests {
         }
 
         assert_eq!(decision_rx.recv().await, Some(DeliveryDecision::Retry));
+    }
+
+    #[tokio::test]
+    async fn async_partitions_serialize_each_key_and_run_different_keys_concurrently() {
+        let codec = JsonCodec;
+        let messages = [("switch-a", 1), ("switch-a", 2), ("switch-b", 1)]
+            .into_iter()
+            .map(|(key, sequence)| {
+                RouteMessage::new(
+                    "input",
+                    codec
+                        .encode(&PartitionInput {
+                            key: key.into(),
+                            sequence,
+                        })
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let active_by_key = Arc::new(tokio::sync::Mutex::new(HashMap::<String, usize>::new()));
+        let observed_order = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<u64>>::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let handler_active_by_key = Arc::clone(&active_by_key);
+        let handler_order = Arc::clone(&observed_order);
+        let handler_active = Arc::clone(&active);
+        let handler_maximum = Arc::clone(&maximum_active);
+
+        let mut router = Router::new()
+            .bind(move |input: PartitionInput| {
+                let active_by_key = Arc::clone(&handler_active_by_key);
+                let order = Arc::clone(&handler_order);
+                let active = Arc::clone(&handler_active);
+                let maximum = Arc::clone(&handler_maximum);
+                async move {
+                    {
+                        let mut keyed = active_by_key.lock().await;
+                        assert_eq!(*keyed.entry(input.key.clone()).or_default(), 0);
+                        keyed.insert(input.key.clone(), 1);
+                    }
+                    order
+                        .lock()
+                        .await
+                        .entry(input.key.clone())
+                        .or_default()
+                        .push(input.sequence);
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    active_by_key.lock().await.insert(input.key, 0);
+                    Ok::<(), std::convert::Infallible>(())
+                }
+            })
+            .partition_by(|input: PartitionInput| async move {
+                tokio::task::yield_now().await;
+                Ok::<_, std::convert::Infallible>(input.key)
+            })
+            .from(MultiSource { messages })
+            .consume();
+
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+
+        let order = observed_order.lock().await;
+        assert_eq!(order["switch-a"], [1, 2]);
+        assert_eq!(order["switch-b"], [1]);
+        assert!(maximum_active.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn shared_partitioner_serializes_the_same_key_across_routes() {
+        let codec = JsonCodec;
+        let message = |sequence| {
+            RouteMessage::new(
+                "input",
+                codec
+                    .encode(&PartitionInput {
+                        key: "switch-a".into(),
+                        sequence,
+                    })
+                    .unwrap(),
+            )
+        };
+        let partitioner = Partitioner::with_capacity(2);
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+
+        let first_active = Arc::clone(&active);
+        let first_maximum = Arc::clone(&maximum_active);
+        let second_active = Arc::clone(&active);
+        let second_maximum = Arc::clone(&maximum_active);
+        let mut router = Router::new()
+            .bind(move |_: PartitionInput| {
+                let active = Arc::clone(&first_active);
+                let maximum = Arc::clone(&first_maximum);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<(), std::convert::Infallible>(())
+                }
+            })
+            .partition_by_with(partitioner.clone(), |input: PartitionInput| async move {
+                Ok::<_, std::convert::Infallible>(input.key)
+            })
+            .from(CustomSource {
+                message: message(1),
+            })
+            .consume()
+            .bind(move |_: PartitionInput| {
+                let active = Arc::clone(&second_active);
+                let maximum = Arc::clone(&second_maximum);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<(), std::convert::Infallible>(())
+                }
+            })
+            .partition_by_with(partitioner, |input: PartitionInput| async move {
+                Ok::<_, std::convert::Infallible>(input.key)
+            })
+            .from(CustomSource {
+                message: message(2),
+            })
+            .consume();
+
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn partition_resolution_failure_uses_error_route_and_failure_settlement() {
+        let codec = JsonCodec;
+        let message = RouteMessage::new(
+            "input",
+            codec
+                .encode(&PartitionInput {
+                    key: "switch-a".into(),
+                    sequence: 1,
+                })
+                .unwrap(),
+        );
+        let (decisions, mut decision_rx) = mpsc::unbounded_channel();
+        let (outputs, mut error_rx) = mpsc::channel(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let mut router = Router::new()
+            .bind(move |_: PartitionInput| {
+                handler_calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<(), std::convert::Infallible>(()) }
+            })
+            .partition_by(|_: PartitionInput| async { Err::<String, _>("partition lookup failed") })
+            .errors_to(CustomTarget { outputs })
+            .from(SettlingSource { message, decisions })
+            .consume();
+
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(decision_rx.recv().await, Some(DeliveryDecision::Reject));
+        let failure: RouteFailure = codec
+            .decode(&error_rx.recv().await.unwrap().payload)
+            .unwrap();
+        assert_eq!(failure.error.stage, RouteErrorStage::Handler);
+        assert!(failure.error.message.contains("partition lookup failed"));
+    }
+
+    #[tokio::test]
+    async fn partitioned_source_settlement_waits_for_handler_completion() {
+        let codec = JsonCodec;
+        let message = RouteMessage::new(
+            "input",
+            codec
+                .encode(&PartitionInput {
+                    key: "switch-a".into(),
+                    sequence: 1,
+                })
+                .unwrap(),
+        );
+        let (decisions, mut decision_rx) = mpsc::unbounded_channel();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler_started = Arc::clone(&started);
+        let handler_release = Arc::clone(&release);
+        let mut router = Router::new()
+            .bind(move |_: PartitionInput| {
+                let started = Arc::clone(&handler_started);
+                let release = Arc::clone(&handler_release);
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok::<(), std::convert::Infallible>(())
+                }
+            })
+            .partition_by(|input: PartitionInput| async move {
+                Ok::<_, std::convert::Infallible>(input.key)
+            })
+            .from(SettlingSource { message, decisions })
+            .consume();
+
+        router.install().await.unwrap();
+        started.notified().await;
+        assert!(decision_rx.try_recv().is_err());
+        release.notify_one();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+        assert_eq!(decision_rx.recv().await, Some(DeliveryDecision::Ack));
     }
 
     #[tokio::test]
