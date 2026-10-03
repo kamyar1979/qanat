@@ -32,13 +32,12 @@ pub struct RouteMessage {
 impl RouteMessage {
     pub fn new(address: impl Into<String>, payload: impl Into<Bytes>) -> Self {
         let message_id = crate::message::new_message_id();
-        let headers = HashMap::from([(crate::MESSAGE_ID_HEADER.to_string(), message_id.clone())]);
         Self {
             address: address.into(),
             timestamp: std::time::Instant::now(),
             id: 0,
             message_id,
-            headers,
+            headers: HashMap::new(),
             metadata: HashMap::new(),
             attempts: 0,
             payload: payload.into(),
