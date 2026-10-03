@@ -23,7 +23,7 @@ pub use bus::raw_message;
 pub use bus::redis_bus;
 #[cfg(any(feature = "nng", feature = "redis"))]
 pub(crate) use bus::wire;
-pub use bus::{Bus, ExternalBus};
+pub use bus::{Bus, DeliveryDecision, ExternalBus, MESSAGE_ID_HEADER};
 
 #[cfg(test)]
 mod tests {

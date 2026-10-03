@@ -174,6 +174,44 @@ Serialization belongs to the source and target adapters. Use their
 `.with_codec(...)` builders to configure each endpoint; the neutral `Router`
 does not own a codec.
 
+### Delivery Settlement
+
+Broker routes acknowledge a source message only after the handler and success
+target complete. A failed route is rejected by default, which avoids an
+accidental infinite redelivery loop. Opt into broker redelivery for a route
+explicitly:
+
+```rust,ignore
+use qanat::{DeliveryDecision, codec::JsonCodec, rabbitmq_bus::RabbitMqBus};
+use qanat::router::{BrokerSource, Router};
+
+# async fn process_order(_: u64) -> Result<(), &'static str> { Ok(()) }
+# async fn example() -> Result<(), qanat::errors::BusError> {
+let bus = RabbitMqBus::connect(
+    JsonCodec,
+    "amqp://guest:guest@localhost:5672/%2f",
+    "orders",
+).await?;
+let _router = Router::new()
+    .bind(process_order)
+    .on_failure(DeliveryDecision::Retry)
+    .from(BrokerSource::new(bus, "orders.process", "order-workers"))
+    .consume();
+# Ok(())
+# }
+```
+
+`Ack` acknowledges failures, `Retry` asks a supporting broker to requeue them,
+and `Reject` negatively acknowledges without requeueing. Backends without
+explicit settlement treat these decisions as no-ops. RabbitMQ uses manual
+acknowledgements and preserves a stable logical ID in its native AMQP
+`message_id`; messages received without one are rejected. The same ID is
+available as `BrokerEnvelope.0.message_id` and `qanat-message-id` on
+header-capable transports. Qanat does not count or cap retries: handlers should
+use that ID for idempotency and application-specific retry tracking. RabbitMQ's
+`Envelope.attempts` is only `0` for an initial delivery and `1` for a
+redelivery, not a retry counter.
+
 Handlers can extract the decoded body, complete broker envelope, all headers,
 individual typed headers, or the raw broker message. The source decodes handler
 input and the target encodes handler output, including error targets.

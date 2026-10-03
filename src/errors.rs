@@ -23,6 +23,9 @@ pub enum BusError {
 
     /// An operation did not complete before its deadline.
     Timeout(String),
+
+    /// A bounded local delivery queue has no capacity available.
+    Backpressure(String),
 }
 
 #[derive(Debug)]
@@ -97,6 +100,7 @@ impl fmt::Display for BusError {
             BusError::Serialization(msg) => write!(f, "Serialization error: {}", msg),
             BusError::Connection(msg) => write!(f, "Connection error: {}", msg),
             BusError::Timeout(msg) => write!(f, "Timeout: {}", msg),
+            BusError::Backpressure(msg) => write!(f, "Backpressure: {}", msg),
         }
     }
 }

@@ -87,12 +87,15 @@ impl<C: Codec + 'static> NngBus<C> {
 
         tokio::spawn(async move {
             while let Some((subject, headers, payload)) = bridge_rx.recv().await {
+                let mut headers = headers.unwrap_or_default();
+                let message_id = crate::message::ensure_message_id(&mut headers);
                 let msg = RawMessage {
                     envelope: Envelope {
                         id: inner.local.next_message_id(),
                         subject: subject.clone(),
                         timestamp: Instant::now(),
-                        headers,
+                        message_id,
+                        headers: Some(headers),
                         attempts: 0,
                     },
                     payload,
@@ -118,17 +121,21 @@ impl<C: Codec> ExternalBus for NngBus<C> {
         headers: Option<HashMap<String, String>>,
     ) -> impl std::future::Future<Output = Result<(), BusError>> + Send + 'a {
         let payload = self.codec().encode(value);
+        let mut headers = headers.unwrap_or_default();
+        let message_id = crate::message::ensure_message_id(&mut headers);
 
         async move {
             let payload = payload?;
-            ExternalBus::publish_bytes(self, subject, payload.clone(), headers.clone()).await?;
+            ExternalBus::publish_bytes(self, subject, payload.clone(), Some(headers.clone()))
+                .await?;
 
             let message = RawMessage {
                 envelope: Envelope {
                     id: self.inner.local.next_message_id(),
                     subject: subject.to_string(),
                     timestamp: Instant::now(),
-                    headers,
+                    message_id,
+                    headers: Some(headers),
                     attempts: 0,
                 },
                 payload,

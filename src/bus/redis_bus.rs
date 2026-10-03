@@ -64,12 +64,15 @@ impl<C: Codec + 'static> RedisBus<C> {
             let mut messages = pubsub.into_on_message();
             while let Some(redis_msg) = messages.next().await {
                 if let Some(frame) = wire::decode(redis_msg.get_payload_bytes()) {
+                    let mut headers = frame.headers.unwrap_or_default();
+                    let message_id = crate::message::ensure_message_id(&mut headers);
                     let msg = RawMessage {
                         envelope: Envelope {
                             id: inner.local.next_message_id(),
                             subject: frame.subject.to_string(),
                             timestamp: Instant::now(),
-                            headers: frame.headers,
+                            message_id,
+                            headers: Some(headers),
                             attempts: 0,
                         },
                         payload: Bytes::copy_from_slice(frame.payload),
@@ -262,6 +265,7 @@ mod tests {
                 id: 1,
                 subject: "internal.event".to_string(),
                 timestamp: Instant::now(),
+                message_id: "message-1".to_string(),
                 headers: None,
                 attempts: 0,
             },

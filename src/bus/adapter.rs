@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::future::LocalBoxFuture;
 
+use crate::DeliveryDecision;
 use crate::bus::Bus;
 use crate::codec::{BuiltinCodecs, CodecCollection, HeaderAwareCodec, content_type};
 use crate::errors::BusError;
@@ -73,6 +74,15 @@ where
                 .await?;
             Ok(Box::pin(stream.map(route_message_from_broker)) as RouteStream)
         })
+    }
+
+    fn settle(
+        &self,
+        message: &RouteMessage,
+        decision: DeliveryDecision,
+    ) -> futures::future::BoxFuture<'_, Result<(), BusError>> {
+        let delivery_id = message.id;
+        Box::pin(async move { self.bus.settle(delivery_id, decision).await })
     }
 }
 

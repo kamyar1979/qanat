@@ -9,6 +9,7 @@ use futures::future::{BoxFuture, LocalBoxFuture};
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::DeliveryDecision;
 use crate::errors::{BackendError, BusError};
 pub use serde_value::Value as PayloadValue;
 use serde_value::Value;
@@ -21,6 +22,7 @@ pub struct RouteMessage {
     pub address: String,
     pub timestamp: std::time::Instant,
     pub id: u64,
+    pub message_id: String,
     pub headers: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub attempts: u32,
@@ -29,11 +31,14 @@ pub struct RouteMessage {
 
 impl RouteMessage {
     pub fn new(address: impl Into<String>, payload: impl Into<Bytes>) -> Self {
+        let message_id = crate::message::new_message_id();
+        let headers = HashMap::from([(crate::MESSAGE_ID_HEADER.to_string(), message_id.clone())]);
         Self {
             address: address.into(),
             timestamp: std::time::Instant::now(),
             id: 0,
-            headers: HashMap::new(),
+            message_id,
+            headers,
             metadata: HashMap::new(),
             attempts: 0,
             payload: payload.into(),
@@ -91,6 +96,7 @@ impl From<BusError> for RouteError {
 pub struct FailedRouteMessage {
     pub address: String,
     pub id: u64,
+    pub message_id: String,
     pub headers: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub attempts: u32,
@@ -102,6 +108,7 @@ impl From<RouteMessage> for FailedRouteMessage {
         Self {
             address: message.address,
             id: message.id,
+            message_id: message.message_id,
             headers: message.headers,
             metadata: message.metadata,
             attempts: message.attempts,
@@ -167,6 +174,14 @@ pub trait RouteSource: Send + Sync + 'static {
     }
 
     fn open(&mut self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>>;
+
+    fn settle(
+        &self,
+        _message: &RouteMessage,
+        _decision: DeliveryDecision,
+    ) -> BoxFuture<'_, Result<(), BusError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub trait RouteTarget: Send + Sync + 'static {
@@ -188,6 +203,7 @@ struct RouteBinding {
     handler: Arc<dyn RouteHandler>,
     target: Option<Arc<dyn RouteTarget>>,
     error_target: Option<Arc<dyn RouteTarget>>,
+    failure_decision: DeliveryDecision,
 }
 
 pub struct Router {
@@ -212,6 +228,7 @@ impl Router {
             router: self,
             handler: handler.into_handler(),
             error_target: None,
+            failure_decision: DeliveryDecision::default(),
             _args: PhantomData,
         }
     }
@@ -234,17 +251,33 @@ impl Router {
             let handler = Arc::clone(&binding.handler);
             let target = binding.target.clone();
             let error_target = binding.error_target.clone();
+            let failure_decision = binding.failure_decision;
 
             self.tasks.push(tokio::spawn(async move {
                 while let Some(message) = subscription.next().await {
                     let Some(target) = target.as_ref() else {
                         let original = message.clone();
-                        if let Err(error) = handler.consume(message, source.as_ref()).await {
-                            deliver_failure(error_target.as_ref(), original, error, None).await;
+                        match handler.consume(message, source.as_ref()).await {
+                            Ok(()) => {
+                                settle(source.as_ref(), &original, DeliveryDecision::Ack).await
+                            }
+                            Err(error) => {
+                                deliver_failure(
+                                    error_target.as_ref(),
+                                    original.clone(),
+                                    error,
+                                    None,
+                                )
+                                .await;
+                                settle(source.as_ref(), &original, failure_decision).await;
+                            }
                         }
                         continue;
                     };
                     if !target.accepts(&message) {
+                        let error = RouteError::delivery("target rejected the route message");
+                        deliver_failure(error_target.as_ref(), message.clone(), error, None).await;
+                        settle(source.as_ref(), &message, failure_decision).await;
                         continue;
                     }
                     let original = message.clone();
@@ -263,21 +296,38 @@ impl Router {
                                 };
                                 deliver_failure(
                                     error_target.as_ref(),
-                                    original,
+                                    original.clone(),
                                     route_error,
                                     response,
                                 )
                                 .await;
+                                settle(source.as_ref(), &original, failure_decision).await;
+                            } else {
+                                settle(source.as_ref(), &original, DeliveryDecision::Ack).await;
                             }
                         }
                         Err(error) => {
-                            deliver_failure(error_target.as_ref(), original, error, None).await;
+                            deliver_failure(error_target.as_ref(), original.clone(), error, None)
+                                .await;
+                            settle(source.as_ref(), &original, failure_decision).await;
                         }
                     }
                 }
             }));
         }
         Ok(())
+    }
+}
+
+async fn settle(source: &dyn RouteSource, message: &RouteMessage, decision: DeliveryDecision) {
+    if let Err(error) = source.settle(message, decision).await {
+        tracing::error!(
+            error = %error,
+            message_id = %message.message_id,
+            local_delivery_id = message.id,
+            ?decision,
+            "source settlement failed"
+        );
     }
 }
 
@@ -291,10 +341,16 @@ pub struct Bind<Args> {
     router: Router,
     handler: Arc<dyn RouteHandler>,
     error_target: Option<Arc<dyn RouteTarget>>,
+    failure_decision: DeliveryDecision,
     _args: PhantomData<fn(Args)>,
 }
 
 impl<Args> Bind<Args> {
+    pub fn on_failure(mut self, decision: DeliveryDecision) -> Self {
+        self.failure_decision = decision;
+        self
+    }
+
     pub fn errors_to<T>(mut self, target: T) -> Self
     where
         T: RouteTarget,
@@ -311,6 +367,7 @@ impl<Args> Bind<Args> {
             router: self.router,
             handler: self.handler,
             error_target: self.error_target,
+            failure_decision: self.failure_decision,
             source: Box::new(source),
             _args: PhantomData,
         }
@@ -321,6 +378,7 @@ pub struct RouteFrom<Args> {
     router: Router,
     handler: Arc<dyn RouteHandler>,
     error_target: Option<Arc<dyn RouteTarget>>,
+    failure_decision: DeliveryDecision,
     source: Box<dyn RouteSource>,
     _args: PhantomData<fn(Args)>,
 }
@@ -334,14 +392,16 @@ impl<Args> RouteFrom<Args> {
     /// The handler is awaited for each message; successful output is discarded
     /// without serialization. Prefer handlers returning Result<(), E>.
     /// Decoding and handler failures are sent to errors_to when configured,
-    /// otherwise logged. This does not change source acknowledgement semantics
-    /// or spawn a detached task for each message.
+    /// otherwise logged. Successful handling acknowledges sources that support
+    /// settlement; failures use the configured `DeliveryDecision` (Reject by
+    /// default). This does not spawn a detached task for each message.
     pub fn consume(mut self) -> Router {
         self.router.bindings.push(RouteBinding {
             source: Some(self.source),
             handler: self.handler,
             target: None,
             error_target: self.error_target,
+            failure_decision: self.failure_decision,
         });
         self.router
     }
@@ -355,6 +415,7 @@ impl<Args> RouteFrom<Args> {
             handler: self.handler,
             target: Some(Arc::new(target)),
             error_target: self.error_target,
+            failure_decision: self.failure_decision,
         });
         self.router
     }
@@ -917,6 +978,37 @@ mod tests {
         }
     }
 
+    struct SettlingSource {
+        message: RouteMessage,
+        decisions: mpsc::UnboundedSender<DeliveryDecision>,
+    }
+
+    impl RouteSource for SettlingSource {
+        fn decode(&self, message: &RouteMessage) -> Result<Value, BusError> {
+            JsonCodec.decode(&message.payload)
+        }
+
+        fn open(&mut self) -> LocalBoxFuture<'_, Result<RouteStream, BusError>> {
+            let message = self.message.clone();
+            Box::pin(
+                async move { Ok(Box::pin(stream::once(async move { message })) as RouteStream) },
+            )
+        }
+
+        fn settle(
+            &self,
+            _message: &RouteMessage,
+            decision: DeliveryDecision,
+        ) -> BoxFuture<'_, Result<(), BusError>> {
+            let decisions = self.decisions.clone();
+            Box::pin(async move {
+                decisions
+                    .send(decision)
+                    .map_err(|_| BusError::Internal("settlement receiver closed".into()))
+            })
+        }
+    }
+
     struct CustomTarget {
         outputs: mpsc::Sender<RouteMessage>,
     }
@@ -1019,6 +1111,64 @@ mod tests {
 
     async fn reject_input(_input: Input) -> Result<Output, &'static str> {
         Err("input was rejected")
+    }
+
+    #[tokio::test]
+    async fn successful_route_acknowledges_source_message() {
+        let (decisions, mut decision_rx) = mpsc::unbounded_channel();
+        let mut router = Router::new()
+            .bind(|_: Input| async { Ok::<(), String>(()) })
+            .from(SettlingSource {
+                message: RouteMessage::new("input", br#"{"value":1}"#.as_slice()),
+                decisions,
+            })
+            .consume();
+
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+
+        assert_eq!(decision_rx.recv().await, Some(DeliveryDecision::Ack));
+    }
+
+    #[tokio::test]
+    async fn failed_route_rejects_by_default() {
+        let (decisions, mut decision_rx) = mpsc::unbounded_channel();
+        let mut router = Router::new()
+            .bind(|_: Input| async { Err::<(), _>("failed") })
+            .from(SettlingSource {
+                message: RouteMessage::new("input", br#"{"value":1}"#.as_slice()),
+                decisions,
+            })
+            .consume();
+
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+
+        assert_eq!(decision_rx.recv().await, Some(DeliveryDecision::Reject));
+    }
+
+    #[tokio::test]
+    async fn failed_route_can_opt_into_retry() {
+        let (decisions, mut decision_rx) = mpsc::unbounded_channel();
+        let mut router = Router::new()
+            .bind(|_: Input| async { Err::<(), _>("failed") })
+            .on_failure(DeliveryDecision::Retry)
+            .from(SettlingSource {
+                message: RouteMessage::new("input", br#"{"value":1}"#.as_slice()),
+                decisions,
+            })
+            .consume();
+
+        router.install().await.unwrap();
+        for task in router.tasks.drain(..) {
+            task.await.unwrap();
+        }
+
+        assert_eq!(decision_rx.recv().await, Some(DeliveryDecision::Retry));
     }
 
     #[tokio::test]

@@ -100,7 +100,7 @@ async fn router_actor<M: Clone + Send + 'static>(mut commands: mpsc::Receiver<Ro
                 msg,
                 reply,
             } => {
-                let result = dispatch(&mut router, &mut senders, &subject, msg).await;
+                let result = dispatch(&mut router, &mut senders, &subject, msg);
                 let _ = reply.send(result);
             }
             RouterCommand::Subscribe { pattern, reply } => {
@@ -131,7 +131,7 @@ async fn router_actor<M: Clone + Send + 'static>(mut commands: mpsc::Receiver<Ro
     }
 }
 
-async fn dispatch<M: Clone + Send + 'static>(
+fn dispatch<M: Clone + Send + 'static>(
     router: &mut SubjectRouter,
     senders: &mut HashMap<ConsumerId, mpsc::Sender<M>>,
     subject: &str,
@@ -139,25 +139,92 @@ async fn dispatch<M: Clone + Send + 'static>(
 ) -> Result<(), BusError> {
     let targets = router.route(subject);
     let mut dead = Vec::new();
+    let mut permits = Vec::with_capacity(targets.len());
 
     for id in targets {
         let Some(tx) = senders.get(&id) else {
             continue;
         };
 
-        if tx.send(msg.clone()).await.is_err() {
-            dead.push(id);
+        match tx.clone().try_reserve_owned() {
+            Ok(permit) => permits.push(permit),
+            Err(mpsc::error::TrySendError::Closed(_)) => dead.push(id),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                remove_consumers(router, senders, dead);
+                return Err(BusError::Backpressure(format!(
+                    "subscriber queue is full for subject '{subject}'"
+                )));
+            }
         }
     }
 
-    for id in dead {
-        router.remove_consumer(id);
-        senders.remove(&id);
+    remove_consumers(router, senders, dead);
+
+    for permit in permits {
+        permit.send(msg.clone());
     }
 
     Ok(())
 }
 
+fn remove_consumers<M: Clone + Send + 'static>(
+    router: &mut SubjectRouter,
+    senders: &mut HashMap<ConsumerId, mpsc::Sender<M>>,
+    dead: Vec<ConsumerId>,
+) {
+    for id in dead {
+        router.remove_consumer(id);
+        senders.remove(&id);
+    }
+}
+
 fn actor_dropped(err: oneshot::error::RecvError) -> BusError {
     BusError::Internal(format!("router actor stopped before replying: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::{FutureExt, StreamExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn full_subscription_does_not_block_unrelated_subjects() {
+        let router = RouterHandle::new();
+        let _slow = router.subscribe("slow").await.unwrap();
+        let mut fast = router.subscribe("fast").await.unwrap();
+
+        for value in 0..SUBSCRIPTION_BUFFER {
+            router.dispatch("slow", value).await.unwrap();
+        }
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            router.dispatch("slow", SUBSCRIPTION_BUFFER),
+        )
+        .await
+        .expect("dispatch waited for subscriber capacity");
+        assert!(matches!(result, Err(BusError::Backpressure(_))));
+
+        router.dispatch("fast", 42).await.unwrap();
+        assert_eq!(fast.next().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn fanout_is_not_partially_delivered_when_one_subscriber_is_full() {
+        let router = RouterHandle::new();
+        let _full = router.subscribe("events").await.unwrap();
+        let mut available = router.subscribe("events").await.unwrap();
+
+        for value in 0..SUBSCRIPTION_BUFFER {
+            router.dispatch("events", value).await.unwrap();
+            assert_eq!(available.next().await, Some(value));
+        }
+
+        let result = router.dispatch("events", SUBSCRIPTION_BUFFER).await;
+        assert!(matches!(result, Err(BusError::Backpressure(_))));
+        assert!(available.next().now_or_never().is_none());
+    }
 }

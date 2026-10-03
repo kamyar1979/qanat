@@ -57,7 +57,7 @@ fn headers_to_nats(
 }
 
 fn nats_msg_to_raw(msg: async_nats::Message, id: u64) -> RawMessage {
-    let headers = msg.headers.map(|h| {
+    let mut headers = msg.headers.map(|h| {
         h.iter()
             .map(|(k, vs)| {
                 (
@@ -67,12 +67,15 @@ fn nats_msg_to_raw(msg: async_nats::Message, id: u64) -> RawMessage {
             })
             .collect::<HashMap<String, String>>()
     });
+    let headers = headers.get_or_insert_with(HashMap::new);
+    let message_id = crate::message::ensure_message_id(headers);
     RawMessage {
         envelope: Envelope {
             id,
             subject: msg.subject.to_string(),
             timestamp: Instant::now(),
-            headers,
+            message_id,
+            headers: Some(std::mem::take(headers)),
             attempts: 0,
         },
         payload: msg.payload,
@@ -298,6 +301,7 @@ mod tests {
                 id: 1,
                 subject: "internal.event".to_string(),
                 timestamp: Instant::now(),
+                message_id: "message-1".to_string(),
                 headers: None,
                 attempts: 0,
             },

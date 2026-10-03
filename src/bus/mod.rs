@@ -32,6 +32,15 @@ pub(crate) mod routing;
 pub(crate) mod wire;
 
 pub use adapter::{BrokerSource, BrokerTarget};
+pub use message::MESSAGE_ID_HEADER;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeliveryDecision {
+    Ack,
+    Retry,
+    #[default]
+    Reject,
+}
 
 /// Channel-backed stream used by local-routed buses.
 pub struct BusStream<M: Clone + Send + 'static> {
@@ -86,6 +95,14 @@ pub trait Bus: Send + Sync {
         pattern: &str,
         group: &str,
     ) -> Result<Self::Subscription, BusError>;
+
+    fn settle(
+        &self,
+        _delivery_id: u64,
+        _decision: DeliveryDecision,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + '_ {
+        async { Ok(()) }
+    }
 }
 
 /// Implementation capability for byte-oriented external bus backends.
@@ -110,14 +127,12 @@ pub trait ExternalBus: Send + Sync {
         headers: Option<HashMap<String, String>>,
     ) -> impl Future<Output = Result<(), BusError>> + Send + 'a {
         let payload = self.codec().encode(value);
-        let mut headers = headers;
+        let mut headers = headers.unwrap_or_default();
+        crate::message::ensure_message_id(&mut headers);
         if self.supports_content_type_headers() {
-            crate::codec::set_content_type(
-                headers.get_or_insert_with(HashMap::new),
-                self.codec().content_type(),
-            );
+            crate::codec::set_content_type(&mut headers, self.codec().content_type());
         }
-        async move { self.publish_bytes(subject, payload?, headers).await }
+        async move { self.publish_bytes(subject, payload?, Some(headers)).await }
     }
 
     fn publish_bytes<'a>(
@@ -133,7 +148,9 @@ pub trait ExternalBus: Send + Sync {
         message: RawMessage,
     ) -> impl Future<Output = Result<(), BusError>> + Send + 'a {
         async move {
-            self.publish_bytes(subject, message.payload, message.envelope.headers)
+            let mut headers = message.envelope.headers.unwrap_or_default();
+            headers.insert(MESSAGE_ID_HEADER.into(), message.envelope.message_id);
+            self.publish_bytes(subject, message.payload, Some(headers))
                 .await
         }
     }
@@ -144,6 +161,14 @@ pub trait ExternalBus: Send + Sync {
         pattern: &str,
         group: &str,
     ) -> Result<Self::Subscription, BusError>;
+
+    fn settle_raw(
+        &self,
+        _delivery_id: u64,
+        _decision: DeliveryDecision,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + '_ {
+        async { Ok(()) }
+    }
 }
 
 impl<T> Bus for T
@@ -175,6 +200,14 @@ where
         group: &str,
     ) -> Result<Self::Subscription, BusError> {
         self.subscribe_group_raw(pattern, group).await
+    }
+
+    fn settle(
+        &self,
+        delivery_id: u64,
+        decision: DeliveryDecision,
+    ) -> impl Future<Output = Result<(), BusError>> + Send + '_ {
+        self.settle_raw(delivery_id, decision)
     }
 }
 
@@ -269,7 +302,9 @@ mod tests {
 
         let message = published.recv().await.unwrap();
         assert_eq!(message.subject, "orders.created");
-        assert_eq!(message.headers, Some(headers));
+        let published_headers = message.headers.unwrap();
+        assert_eq!(published_headers["trace_id"], headers["trace_id"]);
+        assert!(!published_headers[MESSAGE_ID_HEADER].is_empty());
         assert_eq!(JsonCodec.decode::<u32>(&message.payload).unwrap(), 42);
     }
 
@@ -283,6 +318,7 @@ mod tests {
                 subject: "ignored.envelope.subject".to_string(),
                 timestamp: Instant::now(),
                 id: 7,
+                message_id: "message-7".to_string(),
                 headers: Some(headers.clone()),
                 attempts: 0,
             },
@@ -296,7 +332,9 @@ mod tests {
         let message = published.recv().await.unwrap();
         assert_eq!(message.subject, "orders.created");
         assert_eq!(message.payload, payload);
-        assert_eq!(message.headers, Some(headers));
+        let published_headers = message.headers.unwrap();
+        assert_eq!(published_headers["trace_id"], headers["trace_id"]);
+        assert_eq!(published_headers[MESSAGE_ID_HEADER], "message-7");
     }
 
     #[tokio::test]

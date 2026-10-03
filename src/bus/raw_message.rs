@@ -49,6 +49,7 @@ mod tests {
                 subject: "orders.created".to_string(),
                 timestamp: Instant::now(),
                 id: 1,
+                message_id: "message-1".to_string(),
                 headers: None,
                 attempts: 0,
             },

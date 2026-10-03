@@ -34,6 +34,7 @@ impl InMemoryBus {
                 subject: subject.to_string(),
                 timestamp: Instant::now(),
                 id: self.next_msg_id.fetch_add(1, Ordering::Relaxed),
+                message_id: crate::message::new_message_id(),
                 headers,
                 attempts: 0,
             },
@@ -95,6 +96,8 @@ mod tests {
 
         assert_eq!(first.envelope.subject.as_str(), "orders.created");
         assert_eq!(first.envelope.id, 1);
+        assert!(!first.envelope.message_id.is_empty());
+        assert_ne!(first.envelope.message_id, second.envelope.message_id);
         assert_eq!(first.envelope.headers.as_ref(), Some(&headers));
         assert_eq!(first.envelope.attempts, 0);
         assert_eq!(*first.downcast::<u32>().unwrap().payload, 41);

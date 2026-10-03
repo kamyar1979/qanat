@@ -4,11 +4,37 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub const MESSAGE_ID_HEADER: &str = "qanat-message-id";
+
+pub(crate) fn new_message_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+pub(crate) fn message_id_from_headers(headers: &HashMap<String, String>) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(MESSAGE_ID_HEADER))
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn ensure_message_id(headers: &mut HashMap<String, String>) -> String {
+    if let Some(message_id) = message_id_from_headers(headers) {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case(MESSAGE_ID_HEADER));
+        headers.insert(MESSAGE_ID_HEADER.into(), message_id.clone());
+        return message_id;
+    }
+    let message_id = new_message_id();
+    headers.insert(MESSAGE_ID_HEADER.into(), message_id.clone());
+    message_id
+}
+
 #[derive(Clone, Debug)]
 pub struct Envelope {
     pub subject: String,
     pub timestamp: Instant,
     pub id: u64,
+    pub message_id: String,
     pub headers: Option<HashMap<String, String>>,
     pub attempts: u32,
 }
@@ -36,6 +62,9 @@ pub struct Message<T> {
 }
 
 impl AnyMessage {
+    // Returning the original message lets callers recover from a failed downcast
+    // without another allocation; boxing would undermine the in-memory fast path.
+    #[allow(clippy::result_large_err)]
     pub fn downcast<T: Send + Sync + 'static>(self) -> Result<Message<T>, Self> {
         match self.payload.downcast::<T>() {
             Ok(arc_t) => Ok(Message {
@@ -60,6 +89,7 @@ mod tests {
                 subject: "orders.created".to_string(),
                 timestamp: Instant::now(),
                 id: 7,
+                message_id: "message-7".to_string(),
                 headers: None,
                 attempts: 0,
             },

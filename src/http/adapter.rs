@@ -210,7 +210,7 @@ mod source_impl {
             Ok(payload) => payload,
             Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         };
-        let headers = parts
+        let mut headers: std::collections::HashMap<String, String> = parts
             .headers
             .iter()
             .filter_map(|(name, value)| {
@@ -220,6 +220,7 @@ mod source_impl {
                     .map(|value| (name.as_str().to_string(), value.to_string()))
             })
             .collect();
+        let message_id = crate::message::ensure_message_id(&mut headers);
         let metadata = path_parameters
             .into_iter()
             .map(|(key, value)| (format!("{HTTP_PATH_PARAMETER_PREFIX}{key}"), value))
@@ -228,6 +229,7 @@ mod source_impl {
             address: parts.uri.to_string(),
             timestamp: std::time::Instant::now(),
             id: NEXT_HTTP_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            message_id,
             headers,
             metadata,
             attempts: 0,
