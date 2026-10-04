@@ -297,12 +297,24 @@ fn properties_to_headers(properties: &BasicProperties) -> Option<HashMap<String,
     }
 }
 
-fn delivery_to_raw(delivery: &lapin::message::Delivery, id: u64) -> Option<RawMessage> {
-    let headers = properties_to_headers(&delivery.properties);
-    let message_id = headers
+fn ensure_inbound_message_id(headers: &mut Option<HashMap<String, String>>) -> String {
+    if let Some(message_id) = headers
         .as_ref()
-        .and_then(crate::message::message_id_from_headers)?;
-    Some(RawMessage {
+        .and_then(crate::message::message_id_from_headers)
+    {
+        return message_id;
+    }
+    let message_id = uuid::Uuid::new_v4().to_string();
+    headers
+        .get_or_insert_with(HashMap::new)
+        .insert(MESSAGE_ID_HEADER.into(), message_id.clone());
+    message_id
+}
+
+fn delivery_to_raw(delivery: &lapin::message::Delivery, id: u64) -> RawMessage {
+    let mut headers = properties_to_headers(&delivery.properties);
+    let message_id = ensure_inbound_message_id(&mut headers);
+    RawMessage {
         envelope: Envelope {
             id,
             subject: delivery.routing_key.to_string(),
@@ -312,15 +324,12 @@ fn delivery_to_raw(delivery: &lapin::message::Delivery, id: u64) -> Option<RawMe
             attempts: u32::from(delivery.redelivered),
         },
         payload: Bytes::copy_from_slice(&delivery.data),
-    })
+    }
 }
 
 enum SettlementCommand {
     Register {
         delivery_id: u64,
-        acker: Acker,
-    },
-    RejectUnidentified {
         acker: Acker,
     },
     Settle {
@@ -336,17 +345,6 @@ async fn settlement_actor(mut commands: mpsc::UnboundedReceiver<SettlementComman
         match command {
             SettlementCommand::Register { delivery_id, acker } => {
                 ackers.insert(delivery_id, acker);
-            }
-            SettlementCommand::RejectUnidentified { acker } => {
-                if let Err(error) = acker
-                    .nack(BasicNackOptions {
-                        requeue: false,
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    tracing::error!(error = %error, "failed to reject RabbitMQ delivery without message_id");
-                }
             }
             SettlementCommand::Settle {
                 delivery_id,
@@ -419,45 +417,28 @@ impl Stream for RabbitMqStream {
     type Item = RawMessage;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<RawMessage>> {
-        loop {
-            match Pin::new(&mut self.consumer).poll_next(cx) {
-                Poll::Ready(Some(Ok(delivery))) => {
-                    let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                    let Some(message) = delivery_to_raw(&delivery, id) else {
-                        tracing::error!(
-                            routing_key = %delivery.routing_key,
-                            "rejecting RabbitMQ delivery without a stable message_id"
-                        );
-                        if self
-                            .settlements
-                            .send(SettlementCommand::RejectUnidentified {
-                                acker: delivery.acker,
-                            })
-                            .is_err()
-                        {
-                            return Poll::Ready(None);
-                        }
-                        continue;
-                    };
-                    if self
-                        .settlements
-                        .send(SettlementCommand::Register {
-                            delivery_id: id,
-                            acker: delivery.acker,
-                        })
-                        .is_err()
-                    {
-                        return Poll::Ready(None);
-                    }
-                    return Poll::Ready(Some(message));
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    tracing::error!(error = %error, "RabbitMQ consumer failed");
+        match Pin::new(&mut self.consumer).poll_next(cx) {
+            Poll::Ready(Some(Ok(delivery))) => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                let message = delivery_to_raw(&delivery, id);
+                if self
+                    .settlements
+                    .send(SettlementCommand::Register {
+                        delivery_id: id,
+                        acker: delivery.acker,
+                    })
+                    .is_err()
+                {
                     return Poll::Ready(None);
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(message))
             }
+            Poll::Ready(Some(Err(error))) => {
+                tracing::error!(error = %error, "RabbitMQ consumer failed");
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -498,6 +479,20 @@ mod tests {
             Some("message-1")
         );
         assert_eq!(properties_to_headers(&properties), Some(headers));
+    }
+
+    #[test]
+    fn missing_inbound_message_id_is_generated_and_exposed_as_a_header() {
+        let mut headers = Some(HashMap::from([(
+            "content-type".into(),
+            "application/json".into(),
+        )]));
+        let generated = ensure_inbound_message_id(&mut headers);
+        assert!(!generated.is_empty());
+        assert_eq!(headers.as_ref().unwrap()[MESSAGE_ID_HEADER], generated);
+
+        let preserved = ensure_inbound_message_id(&mut headers);
+        assert_eq!(preserved, generated);
     }
 
     #[test]
@@ -591,6 +586,45 @@ mod tests {
             .expect("stream ended");
         assert_eq!(msg.decode_json::<u32>().unwrap(), 42);
         bus.settle(msg.envelope.id, DeliveryDecision::Ack)
+            .await
+            .unwrap();
+
+        cleanup_exchange(&bus).await;
+    }
+
+    #[tokio::test]
+    async fn test_rabbitmq_accepts_external_message_without_message_id() {
+        let bus = rabbit_bus!();
+        let subject = "events.external";
+        let mut sub = bus.subscribe(subject).await.unwrap();
+
+        bus.channel
+            .basic_publish(
+                bus.exchange.clone().into(),
+                subject.into(),
+                BasicPublishOptions::default(),
+                br#"{"source":"third-party"}"#,
+                BasicProperties::default().with_content_type("application/json".into()),
+            )
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let message = timeout(Duration::from_secs(2), sub.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended");
+        assert!(!message.envelope.message_id.is_empty());
+        assert_eq!(
+            message.envelope.headers.as_ref().unwrap()[MESSAGE_ID_HEADER],
+            message.envelope.message_id
+        );
+        assert_eq!(
+            message.decode_json::<serde_json::Value>().unwrap()["source"],
+            "third-party"
+        );
+        bus.settle(message.envelope.id, DeliveryDecision::Ack)
             .await
             .unwrap();
 

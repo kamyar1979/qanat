@@ -484,6 +484,11 @@ Partitioning is transport-neutral and covers handler execution, success/error
 delivery, and source settlement. A broker message therefore remains unsettled
 until its partitioned route job completes.
 
+RabbitMQ publishers should set the AMQP `message_id` property when they need a
+stable transport identity across redelivery. Messages from third-party
+publishers without that property are still accepted; Qanat assigns an inbound
+identity and exposes it through the normal message-ID header.
+
 By default each route owns a private partition domain. Related routes can share
 one process-local domain:
 
