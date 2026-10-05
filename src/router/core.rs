@@ -101,10 +101,18 @@ pub struct FailedRouteMessage {
     pub metadata: HashMap<String, String>,
     pub attempts: u32,
     pub payload: Vec<u8>,
+    /// A readable view of the original payload when its content type declares
+    /// text and the bytes are valid UTF-8. The raw payload remains authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_text: Option<String>,
 }
 
 impl From<RouteMessage> for FailedRouteMessage {
     fn from(message: RouteMessage) -> Self {
+        let payload = message.payload.to_vec();
+        let payload_text = content_type_is_textual(&message.headers)
+            .then(|| String::from_utf8(payload.clone()).ok())
+            .flatten();
         Self {
             address: message.address,
             id: message.id,
@@ -112,9 +120,30 @@ impl From<RouteMessage> for FailedRouteMessage {
             headers: message.headers,
             metadata: message.metadata,
             attempts: message.attempts,
-            payload: message.payload.to_vec(),
+            payload,
+            payload_text,
         }
     }
+}
+
+fn content_type_is_textual(headers: &HashMap<String, String>) -> bool {
+    let Some(value) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value)
+    else {
+        return false;
+    };
+    let media_type = value.split(';').next().unwrap_or_default().trim();
+    let media_type = media_type.to_ascii_lowercase();
+    media_type.starts_with("text/")
+        || media_type == "application/json"
+        || (media_type.starts_with("application/") && media_type.ends_with("+json"))
+        || media_type == "application/xml"
+        || (media_type.starts_with("application/") && media_type.ends_with("+xml"))
+        || media_type == "application/x-www-form-urlencoded"
+        || media_type == "application/javascript"
+        || media_type == "application/ecmascript"
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1062,6 +1091,95 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn failed_message_exposes_text_only_for_declared_utf8_text_payloads() {
+        type Case<'a> = (&'a str, Option<&'a str>, &'a [u8], Option<&'a str>);
+        let cases: [Case<'_>; 5] = [
+            (
+                "JSON with charset",
+                Some("Application/JSON; charset=utf-8"),
+                br#"{"ok":true}"#,
+                Some(r#"{"ok":true}"#),
+            ),
+            (
+                "generic text",
+                Some("text/plain; charset=UTF-8"),
+                b"hello",
+                Some("hello"),
+            ),
+            (
+                "binary content type",
+                Some("application/octet-stream"),
+                b"hello",
+                None,
+            ),
+            (
+                "invalid UTF-8",
+                Some("application/json"),
+                &[0xff, 0xfe],
+                None,
+            ),
+            ("missing content type", None, b"hello", None),
+        ];
+
+        for (name, content_type, bytes, expected_text) in cases {
+            let mut message = RouteMessage::new("test", bytes);
+            if let Some(content_type) = content_type {
+                message
+                    .headers
+                    .insert("Content-Type".into(), content_type.into());
+            }
+            let failed = FailedRouteMessage::from(message);
+            assert_eq!(failed.payload, bytes, "{name}: raw bytes changed");
+            assert_eq!(failed.payload_text.as_deref(), expected_text, "{name}");
+        }
+    }
+
+    #[test]
+    fn common_structured_text_media_types_are_recognized() {
+        for content_type in [
+            "application/problem+json; charset=utf-8",
+            "application/xml",
+            "application/vnd.example+xml",
+            "application/x-www-form-urlencoded",
+            "application/javascript",
+        ] {
+            let mut message = RouteMessage::new("test", "text".as_bytes());
+            message
+                .headers
+                .insert("content-type".into(), content_type.into());
+            assert_eq!(
+                FailedRouteMessage::from(message).payload_text.as_deref(),
+                Some("text"),
+                "{content_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_route_failure_without_payload_text_deserializes() {
+        let legacy = serde_json::json!({
+            "error": {
+                "stage": "handler",
+                "code": "route.handler",
+                "message": "failed"
+            },
+            "original": {
+                "address": "orders",
+                "id": 7,
+                "message_id": "message-7",
+                "headers": {},
+                "metadata": {},
+                "attempts": 2,
+                "payload": [123, 125]
+            }
+        });
+
+        let failure: RouteFailure = serde_json::from_value(legacy).unwrap();
+        assert_eq!(failure.original.payload, b"{}".to_vec());
+        assert_eq!(failure.original.payload_text, None);
+    }
 
     #[derive(Clone)]
     struct CapturedLogs(std::sync::mpsc::Sender<String>);

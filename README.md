@@ -539,7 +539,10 @@ let mut router = Router::new()
 The error target can be any `RouteTarget`, including `BrokerTarget`,
 `HttpTarget`, or a user-defined target. It receives an encoded `RouteFailure`
 containing a transport-neutral `RouteError` and the original address, headers,
-metadata, and payload. Routing headers pass through to the error target.
+metadata, and payload. The original bytes remain in `payload`; when a declared
+textual Content-Type and valid UTF-8 allow it, `payload_text` also contains a
+readable string view. Binary or untyped payloads omit `payload_text`. Routing
+headers pass through to the error target.
 
 For a non-2xx HTTP target response, the error target instead receives the original
 response body unchanged, response headers, and `qanat-http-status` containing the
