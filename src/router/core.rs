@@ -237,10 +237,34 @@ struct PartitionJob {
     completion: tokio::sync::oneshot::Sender<()>,
 }
 
-struct PartitionerInner {
-    capacity: usize,
-    idle_timeout: Duration,
-    queues: tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<PartitionJob>>>,
+type PartitionSender = tokio::sync::mpsc::Sender<PartitionJob>;
+type PartitionSenderReply = tokio::sync::oneshot::Sender<PartitionSender>;
+
+enum PartitionRegistryCommand {
+    Acquire {
+        key: String,
+        reply: PartitionSenderReply,
+    },
+    BeginRetirement {
+        key: String,
+        generation: u64,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    Retired {
+        key: String,
+        generation: u64,
+    },
+}
+
+enum PartitionRegistryEntry {
+    Active {
+        generation: u64,
+        sender: PartitionSender,
+    },
+    Retiring {
+        generation: u64,
+        waiters: Vec<PartitionSenderReply>,
+    },
 }
 
 /// A process-local keyed execution domain shared by one or more routes.
@@ -250,7 +274,13 @@ struct PartitionerInner {
 /// reuse a `Partitioner` to coordinate related routes in the same process.
 #[derive(Clone)]
 pub struct Partitioner {
-    inner: Arc<PartitionerInner>,
+    inner: Arc<PartitionerConfig>,
+}
+
+struct PartitionerConfig {
+    capacity: usize,
+    idle_timeout: Duration,
+    registry: tokio::sync::OnceCell<tokio::sync::mpsc::UnboundedSender<PartitionRegistryCommand>>,
 }
 
 impl Partitioner {
@@ -281,12 +311,28 @@ impl Partitioner {
             "partition idle timeout must be nonzero"
         );
         Self {
-            inner: Arc::new(PartitionerInner {
+            inner: Arc::new(PartitionerConfig {
                 capacity,
                 idle_timeout,
-                queues: tokio::sync::Mutex::new(HashMap::new()),
+                registry: tokio::sync::OnceCell::new(),
             }),
         }
+    }
+
+    async fn registry(&self) -> &tokio::sync::mpsc::UnboundedSender<PartitionRegistryCommand> {
+        self.inner
+            .registry
+            .get_or_init(|| async {
+                let (registry, commands) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(partition_registry(
+                    commands,
+                    registry.downgrade(),
+                    self.inner.capacity,
+                    self.inner.idle_timeout,
+                ));
+                registry
+            })
+            .await
     }
 
     async fn submit_task(
@@ -297,17 +343,17 @@ impl Partitioner {
         let (completion, receiver) = tokio::sync::oneshot::channel();
         let mut job = PartitionJob { task, completion };
         loop {
-            let sender = {
-                let mut queues = self.inner.queues.lock().await;
-                if let Some(sender) = queues.get(&key) {
-                    sender.clone()
-                } else {
-                    let (sender, receiver) = tokio::sync::mpsc::channel(self.inner.capacity);
-                    queues.insert(key.clone(), sender.clone());
-                    spawn_partition_worker(Arc::downgrade(&self.inner), key.clone(), receiver);
-                    sender
-                }
-            };
+            let (reply, sender) = tokio::sync::oneshot::channel();
+            self.registry()
+                .await
+                .send(PartitionRegistryCommand::Acquire {
+                    key: key.clone(),
+                    reply,
+                })
+                .expect("partition registry stopped while its handle is alive");
+            let sender = sender
+                .await
+                .expect("partition registry dropped an acquisition request");
             match sender.send(job).await {
                 Ok(()) => return receiver,
                 Err(error) => job = error.0,
@@ -322,42 +368,169 @@ impl Default for Partitioner {
     }
 }
 
-fn spawn_partition_worker(
-    inner: std::sync::Weak<PartitionerInner>,
-    key: String,
-    mut receiver: tokio::sync::mpsc::Receiver<PartitionJob>,
+async fn partition_registry(
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<PartitionRegistryCommand>,
+    registry: tokio::sync::mpsc::WeakUnboundedSender<PartitionRegistryCommand>,
+    capacity: usize,
+    idle_timeout: Duration,
 ) {
+    let mut entries = HashMap::<String, PartitionRegistryEntry>::new();
+    let mut next_generation = 1u64;
+
+    while let Some(command) = commands.recv().await {
+        match command {
+            PartitionRegistryCommand::Acquire { key, reply } => match entries.get_mut(&key) {
+                Some(PartitionRegistryEntry::Active { sender, .. }) => {
+                    let _ = reply.send(sender.clone());
+                }
+                Some(PartitionRegistryEntry::Retiring { waiters, .. }) => waiters.push(reply),
+                None => {
+                    let generation = next_generation;
+                    next_generation = next_generation.wrapping_add(1);
+                    let sender = spawn_partition_worker(
+                        registry.clone(),
+                        key.clone(),
+                        generation,
+                        capacity,
+                        idle_timeout,
+                    );
+                    let _ = reply.send(sender.clone());
+                    entries.insert(key, PartitionRegistryEntry::Active { generation, sender });
+                }
+            },
+            PartitionRegistryCommand::BeginRetirement {
+                key,
+                generation,
+                reply,
+            } => {
+                let current = entries.remove(&key);
+                match current {
+                    Some(PartitionRegistryEntry::Active {
+                        generation: current_generation,
+                        sender,
+                    }) if current_generation == generation => {
+                        drop(sender);
+                        entries.insert(
+                            key,
+                            PartitionRegistryEntry::Retiring {
+                                generation,
+                                waiters: Vec::new(),
+                            },
+                        );
+                        let _ = reply.send(true);
+                    }
+                    Some(entry) => {
+                        entries.insert(key, entry);
+                        let _ = reply.send(false);
+                    }
+                    None => {
+                        let _ = reply.send(false);
+                    }
+                }
+            }
+            PartitionRegistryCommand::Retired { key, generation } => {
+                let current = entries.remove(&key);
+                match current {
+                    Some(PartitionRegistryEntry::Retiring {
+                        generation: current_generation,
+                        mut waiters,
+                    }) if current_generation == generation => {
+                        waiters.retain(|waiter| !waiter.is_closed());
+                        if waiters.is_empty() {
+                            continue;
+                        }
+                        let next = next_generation;
+                        next_generation = next_generation.wrapping_add(1);
+                        let sender = spawn_partition_worker(
+                            registry.clone(),
+                            key.clone(),
+                            next,
+                            capacity,
+                            idle_timeout,
+                        );
+                        for waiter in waiters {
+                            let _ = waiter.send(sender.clone());
+                        }
+                        entries.insert(
+                            key,
+                            PartitionRegistryEntry::Active {
+                                generation: next,
+                                sender,
+                            },
+                        );
+                    }
+                    Some(entry) => {
+                        entries.insert(key, entry);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
+fn spawn_partition_worker(
+    registry: tokio::sync::mpsc::WeakUnboundedSender<PartitionRegistryCommand>,
+    key: String,
+    generation: u64,
+    capacity: usize,
+    idle_timeout: Duration,
+) -> PartitionSender {
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(capacity);
     tokio::spawn(async move {
         loop {
-            let Some(shared) = inner.upgrade() else {
-                break;
-            };
-            match tokio::time::timeout(shared.idle_timeout, receiver.recv()).await {
+            match tokio::time::timeout(idle_timeout, receiver.recv()).await {
                 Ok(Some(job)) => {
-                    let PartitionJob { task, completion } = job;
-                    if std::panic::AssertUnwindSafe(task)
-                        .catch_unwind()
-                        .await
-                        .is_err()
-                    {
-                        tracing::error!(partition_key = %key, "partition job panicked");
-                    }
-                    let _ = completion.send(());
+                    run_partition_job(&key, job).await;
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    let mut queues = shared.queues.lock().await;
-                    let should_remove = queues
-                        .get(&key)
-                        .is_some_and(|sender| sender.strong_count() == 1);
-                    if should_remove {
-                        queues.remove(&key);
+                    let Some(registry) = registry.upgrade() else {
+                        while let Some(job) = receiver.recv().await {
+                            run_partition_job(&key, job).await;
+                        }
                         break;
+                    };
+                    let (reply, retirement) = tokio::sync::oneshot::channel();
+                    if registry
+                        .send(PartitionRegistryCommand::BeginRetirement {
+                            key: key.clone(),
+                            generation,
+                            reply,
+                        })
+                        .is_err()
+                    {
+                        continue;
                     }
+                    if retirement.await != Ok(true) {
+                        continue;
+                    }
+
+                    // The registry has dropped its sender and queues new
+                    // acquisitions until this generation drains every sender
+                    // that was handed out before retirement began.
+                    while let Some(job) = receiver.recv().await {
+                        run_partition_job(&key, job).await;
+                    }
+                    let _ = registry.send(PartitionRegistryCommand::Retired { key, generation });
+                    break;
                 }
             }
         }
     });
+    sender
+}
+
+async fn run_partition_job(key: &str, job: PartitionJob) {
+    let PartitionJob { task, completion } = job;
+    if std::panic::AssertUnwindSafe(task)
+        .catch_unwind()
+        .await
+        .is_err()
+    {
+        tracing::error!(partition_key = %key, "partition job panicked");
+    }
+    let _ = completion.send(());
 }
 
 trait PartitionResolver: Send + Sync {
@@ -1617,38 +1790,36 @@ mod tests {
                 )
             })
             .collect();
-        let active_by_key = Arc::new(tokio::sync::Mutex::new(HashMap::<String, usize>::new()));
-        let observed_order = Arc::new(tokio::sync::Mutex::new(HashMap::<String, Vec<u64>>::new()));
+        let active_a = Arc::new(AtomicUsize::new(0));
+        let active_b = Arc::new(AtomicUsize::new(0));
+        let (observed_order, mut order_rx) = mpsc::unbounded_channel();
         let active = Arc::new(AtomicUsize::new(0));
         let maximum_active = Arc::new(AtomicUsize::new(0));
-        let handler_active_by_key = Arc::clone(&active_by_key);
-        let handler_order = Arc::clone(&observed_order);
+        let handler_active_a = Arc::clone(&active_a);
+        let handler_active_b = Arc::clone(&active_b);
         let handler_active = Arc::clone(&active);
         let handler_maximum = Arc::clone(&maximum_active);
 
         let mut router = Router::new()
             .bind(move |input: PartitionInput| {
-                let active_by_key = Arc::clone(&handler_active_by_key);
-                let order = Arc::clone(&handler_order);
+                let active_a = Arc::clone(&handler_active_a);
+                let active_b = Arc::clone(&handler_active_b);
+                let order = observed_order.clone();
                 let active = Arc::clone(&handler_active);
                 let maximum = Arc::clone(&handler_maximum);
                 async move {
-                    {
-                        let mut keyed = active_by_key.lock().await;
-                        assert_eq!(*keyed.entry(input.key.clone()).or_default(), 0);
-                        keyed.insert(input.key.clone(), 1);
-                    }
-                    order
-                        .lock()
-                        .await
-                        .entry(input.key.clone())
-                        .or_default()
-                        .push(input.sequence);
+                    let keyed = if input.key == "switch-a" {
+                        &active_a
+                    } else {
+                        &active_b
+                    };
+                    assert_eq!(keyed.fetch_add(1, Ordering::SeqCst), 0);
+                    order.send((input.key, input.sequence)).unwrap();
                     let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                     maximum.fetch_max(now, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(25)).await;
                     active.fetch_sub(1, Ordering::SeqCst);
-                    active_by_key.lock().await.insert(input.key, 0);
+                    assert_eq!(keyed.fetch_sub(1, Ordering::SeqCst), 1);
                     Ok::<(), std::convert::Infallible>(())
                 }
             })
@@ -1664,7 +1835,11 @@ mod tests {
             task.await.unwrap();
         }
 
-        let order = observed_order.lock().await;
+        let mut order = HashMap::<String, Vec<u64>>::new();
+        for _ in 0..3 {
+            let (key, sequence) = order_rx.recv().await.unwrap();
+            order.entry(key).or_default().push(sequence);
+        }
         assert_eq!(order["switch-a"], [1, 2]);
         assert_eq!(order["switch-b"], [1]);
         assert!(maximum_active.load(Ordering::SeqCst) >= 2);
@@ -1737,6 +1912,120 @@ mod tests {
 
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn full_partition_does_not_block_an_unrelated_key() {
+        let partitioner = Partitioner::with_capacity(1);
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::clone(&first_started);
+        let release = Arc::clone(&release_first);
+        let first = partitioner
+            .submit_task(
+                "busy".into(),
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                }),
+            )
+            .await;
+        first_started.notified().await;
+
+        let second = partitioner
+            .submit_task("busy".into(), Box::pin(async {}))
+            .await;
+        let blocked_partitioner = partitioner.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_partitioner
+                .submit_task("busy".into(), Box::pin(async {}))
+                .await
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let unrelated = partitioner
+            .submit_task("free".into(), Box::pin(async {}))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), unrelated)
+            .await
+            .unwrap()
+            .unwrap();
+
+        release_first.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        blocked.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retiring_partition_drains_stale_senders_before_replacement() {
+        let idle_timeout = Duration::from_millis(20);
+        let partitioner = Partitioner::with_options(2, idle_timeout);
+        let (reply, sender) = tokio::sync::oneshot::channel();
+        partitioner
+            .registry()
+            .await
+            .send(PartitionRegistryCommand::Acquire {
+                key: "shared".into(),
+                reply,
+            })
+            .unwrap();
+        let stale_sender = sender.await.unwrap();
+
+        tokio::time::sleep(idle_timeout * 5).await;
+        let (order, mut observed) = mpsc::unbounded_channel();
+        let next_partitioner = partitioner.clone();
+        let next_order = order.clone();
+        let next = tokio::spawn(async move {
+            next_partitioner
+                .submit_task(
+                    "shared".into(),
+                    Box::pin(async move {
+                        next_order.send(2).unwrap();
+                    }),
+                )
+                .await
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        assert!(
+            stale_sender
+                .send(PartitionJob {
+                    task: Box::pin(async move {
+                        order.send(1).unwrap();
+                    }),
+                    completion: tokio::sync::oneshot::channel().0,
+                })
+                .await
+                .is_ok()
+        );
+        drop(stale_sender);
+
+        next.await.unwrap();
+        assert_eq!(observed.recv().await, Some(1));
+        assert_eq!(observed.recv().await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn panicking_partition_job_still_completes() {
+        let partitioner = Partitioner::new();
+        let completion = partitioner
+            .submit_task(
+                "panic".into(),
+                Box::pin(async {
+                    panic!("expected test panic");
+                }),
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -593,9 +593,8 @@ mod tests {
     use futures::StreamExt;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex;
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct MockState {
         records: VecDeque<OutboxRecord>,
         acknowledged: Vec<(String, String)>,
@@ -603,15 +602,92 @@ mod tests {
         claims: Vec<OutboxClaim>,
     }
 
-    #[derive(Default)]
+    enum MockStoreCommand {
+        Push(OutboxRecord, oneshot::Sender<()>),
+        Claim(
+            OutboxClaim,
+            oneshot::Sender<Result<Vec<LeasedOutboxRecord>, String>>,
+        ),
+        Acknowledge(String, String, oneshot::Sender<Result<(), String>>),
+        Release(
+            String,
+            String,
+            Option<SystemTime>,
+            oneshot::Sender<Result<(), String>>,
+        ),
+        Snapshot(oneshot::Sender<MockState>),
+    }
+
     struct MockStore {
-        state: Mutex<MockState>,
+        commands: mpsc::UnboundedSender<MockStoreCommand>,
         renewals: AtomicUsize,
+    }
+
+    impl Default for MockStore {
+        fn default() -> Self {
+            let (commands, mut requests) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut state = MockState::default();
+                while let Some(command) = requests.recv().await {
+                    match command {
+                        MockStoreCommand::Push(record, reply) => {
+                            state.records.push_back(record);
+                            let _ = reply.send(());
+                        }
+                        MockStoreCommand::Claim(claim, reply) => {
+                            state.claims.push(claim.clone());
+                            let claimed = state
+                                .records
+                                .pop_front()
+                                .map(|record| {
+                                    vec![LeasedOutboxRecord {
+                                        record,
+                                        lease: OutboxLease {
+                                            consumer_id: claim.consumer_id,
+                                            token: "lease-1".into(),
+                                            until: claim.lease_until,
+                                        },
+                                    }]
+                                })
+                                .unwrap_or_default();
+                            let _ = reply.send(Ok(claimed));
+                        }
+                        MockStoreCommand::Acknowledge(record_id, lease_token, reply) => {
+                            state.acknowledged.push((record_id, lease_token));
+                            let _ = reply.send(Ok(()));
+                        }
+                        MockStoreCommand::Release(record_id, lease_token, available_at, reply) => {
+                            state.released.push((record_id, lease_token, available_at));
+                            let _ = reply.send(Ok(()));
+                        }
+                        MockStoreCommand::Snapshot(reply) => {
+                            let _ = reply.send(state.clone());
+                        }
+                    }
+                }
+            });
+            Self {
+                commands,
+                renewals: AtomicUsize::new(0),
+            }
+        }
     }
 
     impl MockStore {
         async fn push(&self, record: OutboxRecord) {
-            self.state.lock().await.records.push_back(record);
+            let (reply, pushed) = oneshot::channel();
+            self.commands
+                .send(MockStoreCommand::Push(record, reply))
+                .unwrap();
+            pushed.await.unwrap();
+        }
+
+        async fn snapshot(&self) -> MockState {
+            let (reply, snapshot) = oneshot::channel();
+            self.commands
+                .send(MockStoreCommand::Snapshot(reply))
+                .unwrap();
+            snapshot.await.unwrap()
         }
     }
 
@@ -623,22 +699,13 @@ mod tests {
             claim: OutboxClaim,
         ) -> BoxFuture<'_, Result<Vec<LeasedOutboxRecord>, Self::Error>> {
             Box::pin(async move {
-                let mut state = self.state.lock().await;
-                state.claims.push(claim.clone());
-                Ok(state
-                    .records
-                    .pop_front()
-                    .map(|record| {
-                        vec![LeasedOutboxRecord {
-                            record,
-                            lease: OutboxLease {
-                                consumer_id: claim.consumer_id,
-                                token: "lease-1".into(),
-                                until: claim.lease_until,
-                            },
-                        }]
-                    })
-                    .unwrap_or_default())
+                let (reply, result) = oneshot::channel();
+                self.commands
+                    .send(MockStoreCommand::Claim(claim, reply))
+                    .map_err(|_| "mock store actor stopped".to_string())?;
+                result
+                    .await
+                    .map_err(|_| "mock store claim reply was dropped".to_string())?
             })
         }
 
@@ -648,12 +715,17 @@ mod tests {
             lease_token: &'a str,
         ) -> BoxFuture<'a, Result<(), Self::Error>> {
             Box::pin(async move {
-                self.state
-                    .lock()
+                let (reply, result) = oneshot::channel();
+                self.commands
+                    .send(MockStoreCommand::Acknowledge(
+                        record_id.into(),
+                        lease_token.into(),
+                        reply,
+                    ))
+                    .map_err(|_| "mock store actor stopped".to_string())?;
+                result
                     .await
-                    .acknowledged
-                    .push((record_id.into(), lease_token.into()));
-                Ok(())
+                    .map_err(|_| "mock store acknowledge reply was dropped".to_string())?
             })
         }
 
@@ -664,12 +736,18 @@ mod tests {
             available_at: Option<SystemTime>,
         ) -> BoxFuture<'a, Result<(), Self::Error>> {
             Box::pin(async move {
-                self.state.lock().await.released.push((
-                    record_id.into(),
-                    lease_token.into(),
-                    available_at,
-                ));
-                Ok(())
+                let (reply, result) = oneshot::channel();
+                self.commands
+                    .send(MockStoreCommand::Release(
+                        record_id.into(),
+                        lease_token.into(),
+                        available_at,
+                        reply,
+                    ))
+                    .map_err(|_| "mock store actor stopped".to_string())?;
+                result
+                    .await
+                    .map_err(|_| "mock store release reply was dropped".to_string())?
             })
         }
 
@@ -700,7 +778,7 @@ mod tests {
 
     struct GatedTarget {
         started: mpsc::UnboundedSender<()>,
-        release: Mutex<Option<oneshot::Receiver<()>>>,
+        release: Arc<tokio::sync::Notify>,
     }
 
     impl RouteTarget for GatedTarget {
@@ -714,12 +792,8 @@ mod tests {
                 self.started
                     .send(())
                     .map_err(|_| BusError::Internal("target observer closed".into()))?;
-                let release = self.release.lock().await.take().ok_or_else(|| {
-                    BusError::Internal("target release signal was already consumed".into())
-                })?;
-                release
-                    .await
-                    .map_err(|_| BusError::Internal("target release signal was dropped".into()))
+                self.release.notified().await;
+                Ok(())
             })
         }
     }
@@ -742,7 +816,7 @@ mod tests {
         assert_eq!(message.metadata["tenant"], "one");
         assert_eq!(message.attempts, 2);
         assert_eq!(source.decode(&message).unwrap(), PayloadValue::U64(42));
-        let state = store.state.lock().await;
+        let state = store.snapshot().await;
         assert_eq!(state.claims.len(), 1);
         assert_eq!(state.claims[0].limit, 1);
     }
@@ -763,7 +837,7 @@ mod tests {
 
             source.settle(&message, decision).await.unwrap();
 
-            let state = store.state.lock().await;
+            let state = store.snapshot().await;
             match decision {
                 DeliveryDecision::Retry => {
                     assert!(state.acknowledged.is_empty());
@@ -812,22 +886,22 @@ mod tests {
         let source = LeasedOutboxSource::from_shared(Arc::clone(&store), "worker-1")
             .with_poll_interval(Duration::from_millis(10));
         let (started, mut target_started) = mpsc::unbounded_channel();
-        let (release_target, released) = oneshot::channel();
+        let release_target = Arc::new(tokio::sync::Notify::new());
         let mut router = Router::new()
             .bind(|value: u32| async move { Ok::<_, String>(value + 1) })
             .from(source)
             .to(GatedTarget {
                 started,
-                release: Mutex::new(Some(released)),
+                release: Arc::clone(&release_target),
             });
         router.install().await.unwrap();
 
         target_started.recv().await.unwrap();
-        assert!(store.state.lock().await.acknowledged.is_empty());
-        release_target.send(()).unwrap();
+        assert!(store.snapshot().await.acknowledged.is_empty());
+        release_target.notify_one();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !store.state.lock().await.acknowledged.is_empty() {
+                if !store.snapshot().await.acknowledged.is_empty() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -835,7 +909,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(store.state.lock().await.acknowledged[0].0, "event-1");
+        assert_eq!(store.snapshot().await.acknowledged[0].0, "event-1");
     }
 
     #[tokio::test]
