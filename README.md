@@ -212,6 +212,45 @@ use that ID for idempotency and application-specific retry tracking. RabbitMQ's
 `Envelope.attempts` is only `0` for an initial delivery and `1` for a
 redelivery, not a retry counter.
 
+### Durable Outbox Sources
+
+`LeasedOutboxSource` turns durable, provider-owned outbox records into a Qanat
+route source. Qanat defines the `OutboxStore` persistence contract but does not
+ship an in-memory production store: the application provider must insert its
+domain change and outbox record in the same transaction.
+
+```rust,ignore
+use std::sync::Arc;
+use std::time::Duration;
+use qanat::{DeliveryDecision, outbox::{LeasedOutboxSource, OutboxStore}};
+use qanat::router::{BrokerTarget, Router};
+
+# async fn expose_event(_: serde_json::Value) -> Result<serde_json::Value, String> {
+#     unreachable!()
+# }
+# fn example<B: qanat::Bus<Message = qanat::raw_message::RawMessage> + 'static>(
+#     bus: B,
+#     store: Arc<dyn OutboxStore<Error = String>>,
+# ) {
+let source = LeasedOutboxSource::from_shared(store, "realization-relay")
+    .with_lease_duration(Duration::from_secs(30))
+    .with_retry_delay(Duration::from_secs(1));
+
+let _router = Router::new()
+    .bind(expose_event)
+    .on_failure(DeliveryDecision::Retry)
+    .from(source)
+    .to(BrokerTarget::new(bus, "oss.realization.event.v1"));
+# }
+```
+
+The source claims one record at a time, acknowledges it only after successful
+routing, releases it after `Retry`, and terminally acknowledges it after
+`Reject`. Optional `.with_lease_renewal(interval)` keeps long-running deliveries
+leased; enable it only when the store implements `renew_lease`. The provider is
+responsible for atomic claims, stale-token rejection, durable retry timestamps,
+and the original state-change/outbox transaction.
+
 Handlers can extract the decoded body, complete broker envelope, all headers,
 individual typed headers, or the raw broker message. The source decodes handler
 input and the target encodes handler output, including error targets.

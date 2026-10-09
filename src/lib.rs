@@ -4,6 +4,7 @@
 pub mod bus;
 pub mod errors;
 pub mod http;
+pub mod outbox;
 pub mod router;
 
 pub use bus::codec;
